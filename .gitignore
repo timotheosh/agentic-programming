@@ -1,2 +1,5 @@
 graft/
 *.log
+.ai/
+.claude/
+probity.config.ts

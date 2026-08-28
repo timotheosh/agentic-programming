@@ -24,7 +24,7 @@ Although the original idea has four conceptual stages (A, B, C, D), the latest d
 Copy the named sections into this repository layout:
 
 #+begin_example
-CLAUDE.md
+.claude/CLAUDE.md
 probity.config.ts
 .claude/
 └── agents/
@@ -95,7 +95,7 @@ Use this workflow for feature development, behavior changes, and bug fixes unles
 
 ### Durable state
 
-Before delegation, create or resume `.ai/workflow/current.md`. Record the requirement identifier or short feature name, the current git revision, stage statuses, artifacts, test commands/results, review rounds, findings, and unresolved decisions. Update it after every stage and before any handoff. Treat repository state and durable artifacts as authoritative over conversational memory.
+Before delegation, create or resume `.ai/workflow/current.md`. If it does not exist, initialize it from `.ai/workflow/current.template.md`. Never replace an existing `current.md`. Record the requirement identifier or short feature name, the current git revision, stage statuses, artifacts, test commands/results, review rounds, findings, and unresolved decisions. Update it after every stage and before any handoff. Treat repository state and durable artifacts as authoritative over conversational memory.
 
 Allowed stage states are `NOT_STARTED`, `IN_PROGRESS`, `BLOCKED`, `COMPLETE`, `APPROVED`, and `REQUEST_CHANGES`. Never infer approval from silence, timeout, malformed output, tool failure, or a missing artifact; those conditions fail closed.
 
@@ -190,7 +190,21 @@ Update your stage in `.ai/workflow/current.md`. Stop at verified RED. Return a c
 
 * Copy into =.claude/agents/implementer.md=
 
-#+begin_src markdown :tangle .claude/agents/implementer.md
+The implementer's ACD guidance is maintained as a living Markdown prompt in =prompts/prompt_from_6.md=. The named reader block makes that external file available to noweb during tangling, while the include directive renders the same source in exported versions of this document.
+
+#+name: latest-acd-prompt
+#+begin_src emacs-lisp :var path="prompts/prompt_from_6.md" :results value raw :tangle no :exports none
+(let ((prompt-file
+       (expand-file-name path
+                         (file-name-directory (buffer-file-name)))))
+  (unless (file-readable-p prompt-file)
+    (error "Living ACD prompt is missing or unreadable: %s" prompt-file))
+  (with-temp-buffer
+    (insert-file-contents prompt-file)
+    (buffer-string)))
+#+end_src
+
+#+begin_src markdown :tangle .claude/agents/implementer.md :noweb yes
 ---
 name: implementer
 description: Implements production behavior from independently written RED tests using ACD, coverage, and explicit data contracts.
@@ -201,13 +215,11 @@ You are the Implementer. Make the independently designed behavioral tests pass w
 
 Read the original requirements, `.ai/workflow/current.md`, `.ai/test-plan.md`, the failing tests, and relevant existing code. Confirm the recorded RED failure before changing production behavior.
 
-Apply ACD (Abstract, Compose, Delegate):
-- Abstract at stable semantic boundaries, not merely to reduce line count.
-- Compose behavior from small, explicit functions and existing capabilities.
-- Delegate responsibility to the component that already owns it; preserve architectural boundaries.
-- Prefer explicit data transformations and narrow interfaces.
-- Reuse an existing abstraction when it genuinely represents the same concept.
-- Avoid speculative generalization, unnecessary indirection, and framework invention.
+Apply the following living Action / Calculation / Data guidance:
+
+<<latest-acd-prompt()>>
+
+## Workflow-specific implementation constraints
 
 Never delete, skip, weaken, or rewrite an independent behavioral test merely to get GREEN. If a test contradicts the requirement or encodes an invalid assumption, stop and report the exact test, requirement, conflict, and proposed resolution to the orchestrator.
 
@@ -234,6 +246,10 @@ Write `.ai/implementation-report.md` with:
 
 Update `.ai/workflow/current.md`. Stop at GREEN and return the review packet. Do not approve your own work and do not invoke final documentation.
 #+end_src
+
+** Living ACD prompt
+
+#+INCLUDE: "prompts/prompt_from_6.md" src markdown
 
 * Copy into =.claude/agents/correctness-reviewer.md=
 
@@ -352,9 +368,10 @@ Validate that the `.drawio` file opens or parses with the project's available to
 
 * Durable workflow state template
 
-Create =.ai/workflow/current.md= from this template for each active feature. A per-feature filename such as =.ai/workflow/JIRA-1234.md= is preferable when several workflows may run concurrently.
+The tangled template is maintained by this document. The installer initializes =.ai/workflow/current.md= from it only when =current.md= does not already exist. A per-feature runtime filename such as =.ai/workflow/JIRA-1234.md= is preferable when several workflows may run concurrently.
 
-#+begin_src markdown :tangle .ai/workflow/current.md
+#+name: workflow-state-template
+#+begin_src markdown :tangle .ai/workflow/current.template.md
 # Workflow state: <requirement-id or feature>
 
 - Requirement source: <URL, issue, or verbatim text>
@@ -393,6 +410,14 @@ Create =.ai/workflow/current.md= from this template for each active feature. A p
 - <timestamp> — <agent/stage> — <result and artifact>
 #+end_src
 
+** Non-clobbering initialization
+
+Ordinary =org-babel-tangle= always refreshes =current.template.md=. The following conditional tangle target also creates =current.md= when it is absent and resolves to =no= when it already exists. The noweb reference keeps both files sourced from the same template body.
+
+#+begin_src markdown :tangle (if (file-exists-p ".ai/workflow/current.md") "no" ".ai/workflow/current.md") :noweb yes
+<<workflow-state-template>>
+#+end_src
+
 * Probity: scoped installation and policy
 
 ** Why the hook is agent-local
@@ -423,7 +448,7 @@ Probity's built-in =enforceTdd()= models the usual full RED → GREEN → REFACT
 
 The following valid baseline configuration blocks the test designer from writes to the listed production paths. Customize both production and test path globs for the repository. The hook is absent from every other agent, so this restriction applies only while =test-designer= is active.
 
-#+begin_src typescript :tangle
+#+begin_src typescript :tangle probity.config.ts
 // probity.config.ts
 import { defineConfig, type Rule } from '@nizos/probity'
 
@@ -505,16 +530,14 @@ A workflow is done only when all statements are true:
 
 * Setup checklist
 
-1. Copy the =CLAUDE.md= section into the repository's top-level =CLAUDE.md=.
-2. Create the five files under =.claude/agents/= from their named sections.
-3. Adapt tool names if the installed Claude Code version exposes a different tool set.
-4. Install Probity and copy/adapt =probity.config.ts=.
-5. Confirm Probity appears only in =test-designer.md=, not =settings.json= or other agent definitions.
-6. Customize production/test path matching before trusting the mechanical boundary.
-7. Trust the project folder in Claude Code so the agent-local hook runs.
-8. Restart Claude Code if the new agent directory is not discovered.
-9. Run =/agents= or ask Claude Code to list the five project agents.
-10. Pilot on a small behavior change and inspect RED evidence, routing, dual approvals, and Draw.io output before broad adoption.
+1. Run =org-babel-tangle=. It generates the maintained files and initializes runtime workflow state without replacing existing state.
+2. Adapt tool names if the installed Claude Code version exposes a different tool set.
+3. Install Probity and adapt =probity.config.ts= to the project's production and test paths.
+4. Confirm Probity appears only in =test-designer.md=, not =settings.json= or other agent definitions.
+5. Trust the project folder in Claude Code so the agent-local hook runs.
+6. Restart Claude Code if the new agent directory is not discovered.
+7. Run =/agents= or ask Claude Code to list the five project agents.
+8. Pilot on a small behavior change and inspect RED evidence, routing, dual approvals, and Draw.io output before broad adoption.
 
 * Sources and version notes
 
