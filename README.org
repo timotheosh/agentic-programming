@@ -15,7 +15,7 @@ This document is a copy-ready template for a Claude Code development workflow in
 4. =structural-reviewer= checks duplication, contracts, schemas/specs, complexity, and maintainability.
 5. =flow-documenter= documents the final approved runtime flow in Draw.io.
 
-The two reviewers form a fail-closed AND gate. Neither reviewer may edit files. A task is complete only when both approve the same revision and the final flow documentation is complete.
+The two reviewers form a fail-closed AND gate. Neither reviewer may edit files. Each implementation slice must pass that gate, but =flow-documenter= runs only once: after every planned slice is complete and both reviewers approve the final integrated revision. The overall task is complete only when that final flow documentation is complete.
 
 Although the original idea has four conceptual stages (A, B, C, D), the latest design splits stage C into two independent agents. The practical installation therefore contains five files under =.claude/agents/=.
 
@@ -50,38 +50,26 @@ Project subagents belong in =.claude/agents/= and may be committed with the repo
 * Operating model
 
 #+begin_example
-Requirements
-    │
-    ▼
-test-designer + agent-local Probity hook
-    │
-    ├── executable behavioral tests
-    ├── .ai/test-plan.md
-    └── verified RED for the intended missing behavior
-    │
-    ▼
-implementer + ACD
-    │
-    ├── production code
-    ├── meaningful business/calculation coverage
-    ├── boundary contracts (spec/schema/type/validation)
-    ├── complete relevant suite GREEN
-    └── .ai/implementation-report.md
-    │
-    ├──────────────────────┐
-    ▼                      ▼
-correctness-reviewer       structural-reviewer
-requirements/tests/        duplication/contracts/
-behavior/coverage          complexity/maintainability
-    │                      │
-    └──────── AND ─────────┘
-              │
-       APPROVE on same revision
+Requirements and planned slices
               │
               ▼
-       flow-documenter
-              │
-              └── docs/<feature>-flow.drawio
+  ┌──── repeat for each slice ────┐
+  │ test-designer → verified RED  │
+  │              │                │
+  │              ▼                │
+  │ implementer + ACD → GREEN     │
+  │              │                │
+  │              ▼                │
+  │ correctness + structural      │
+  │ reviewers → dual approval     │
+  └──────────────┬────────────────┘
+                 │ all slices complete and
+                 │ final revision approved
+                 │
+                 ▼
+          flow-documenter (once)
+                 │
+                 └── docs/<feature>-flow.drawio
 #+end_example
 
 Reviewers may run concurrently after implementation, but they must receive the original requirements before the implementation report so the implementer's narrative does not define correctness.
@@ -101,8 +89,8 @@ Allowed stage states are `NOT_STARTED`, `IN_PROGRESS`, `BLOCKED`, `COMPLETE`, `A
 
 ### Required sequence
 
-1. Save the original requirements verbatim or by stable reference in `.ai/workflow/current.md`.
-2. Delegate test design to `test-designer`.
+1. Save the original requirements verbatim or by stable reference in `.ai/workflow/current.md`. Record the complete list of planned implementation slices and their statuses before beginning work.
+2. For the next incomplete slice, delegate test design to `test-designer`.
 3. Confirm all of the following before implementation:
    - `.ai/test-plan.md` exists and maps tests to requirements;
    - the new tests were executed;
@@ -118,9 +106,11 @@ Allowed stage states are `NOT_STARTED`, `IN_PROGRESS`, `BLOCKED`, `COMPLETE`, `A
    - if a change crosses ownership, send it to both in dependency order: test designer first, then implementer;
    - re-establish RED when behavioral tests change, then re-establish GREEN;
    - rerun both reviewers against the new revision, even if only one previously requested changes.
-9. Continue the fix/review loop for at most five rounds. If blocking findings remain, reviewers materially disagree, or requirements are ambiguous in a way that changes public behavior or architecture, stop and escalate to the user with evidence and options.
-10. Only after both reviewers approve the same revision, delegate to `flow-documenter`.
-11. Confirm the Draw.io artifact reflects the approved implementation and update `.ai/workflow/current.md` to `COMPLETE`.
+9. Continue the slice's fix/review loop for at most five rounds. If blocking findings remain, reviewers materially disagree, or requirements are ambiguous in a way that changes public behavior or architecture, stop and escalate to the user with evidence and options.
+10. After both reviewers approve the slice, record its completion and proceed to the next planned slice. Do not delegate to `flow-documenter` between slices.
+11. When every planned slice is complete, run the complete relevant test suite. Confirm that the most recent dual approval names the current integrated revision; do not add a redundant review round when that revision has not changed since approval.
+12. Delegate once to `flow-documenter`.
+13. Confirm the Draw.io artifact reflects the final approved implementation and update `.ai/workflow/current.md` to `COMPLETE`.
 
 Do not declare the task complete before all gates pass. Do not let passing tests substitute for requirements review. Do not let an approval apply to code changed after that approval.
 
@@ -130,7 +120,7 @@ Do not declare the task complete before all gates pass. Do not let passing tests
 - `implementer` owns production code, implementation-specific unit tests, business/calculation coverage, and data-boundary contracts. It must not weaken independent behavioral tests to obtain GREEN.
 - `correctness-reviewer` is read-only and judges requirements ↔ tests ↔ behavior, including meaningful coverage.
 - `structural-reviewer` is read-only and judges duplication, abstraction, data contracts, schemas/specs, complexity, and maintainability.
-- `flow-documenter` runs only after dual approval and documents the code that exists, not the design that was intended.
+- `flow-documenter` runs once, only after all planned slices are complete and the final integrated revision has dual approval. It documents the code that exists, not the design that was intended.
 
 ### Test conflict rule
 
@@ -342,13 +332,13 @@ Do not demand abstraction solely because two snippets look alike. If required in
 #+begin_src markdown :tangle .claude/agents/flow-documenter.md
 ---
 name: flow-documenter
-description: Creates or updates a Draw.io function-flow diagram only after correctness and structural approval.
+description: Creates or updates the final Draw.io function-flow diagram once, after all planned slices and final integrated review are complete.
 tools: Read, Write, Edit, Bash, Grep, Glob
 ---
 
-You are the Flow Documenter. Run only after both reviewers have approved the same current revision.
+You are the Flow Documenter. Run exactly once for the overall task, only after every planned implementation slice is complete and both reviewers have approved the same final integrated revision. Never run merely because an individual slice was approved.
 
-Before writing, verify `.ai/workflow/current.md`, `.ai/reviews/correctness.md`, and `.ai/reviews/structural.md`. If approvals are absent, malformed, or name a different revision, stop without changing documentation.
+Before writing, verify `.ai/workflow/current.md`, `.ai/reviews/correctness.md`, and `.ai/reviews/structural.md`. Confirm that no planned slice remains incomplete and that both review artifacts explicitly approve the final integrated revision. If slice completion evidence or approvals are absent, malformed, stale, or name a different revision, stop without changing documentation.
 
 Read the final implementation itself. Planning notes and implementation reports are navigation aids, not architectural truth.
 
@@ -378,6 +368,8 @@ The tangled template is maintained by this document. The installer initializes =
 - Started: <ISO-8601 timestamp>
 - Current revision: <git commit plus dirty-state note>
 - Review round: 0 of 5
+- Planned slices: <ordered list or stable plan reference>
+- Current slice: <name, number, or “final integration”>
 - Next action: <specific action>
 
 | Stage | Status | Artifact / evidence |
@@ -388,7 +380,8 @@ The tangled template is maintained by this document. The installer initializes =
 | Relevant suite GREEN | NOT_STARTED | command + result |
 | Correctness review | NOT_STARTED | `.ai/reviews/correctness.md` |
 | Structural review | NOT_STARTED | `.ai/reviews/structural.md` |
-| Flow documentation | NOT_STARTED | `docs/<feature>-flow.drawio` |
+| Final revision approval | NOT_STARTED | both review artifacts approve current integrated revision |
+| Final flow documentation (run once) | NOT_STARTED | `docs/<feature>-flow.drawio` |
 
 ## Review target
 
