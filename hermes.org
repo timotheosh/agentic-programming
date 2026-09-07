@@ -1,0 +1,871 @@
+#+TITLE: Hermes Multi-Agent Development Workflow
+#+SUBTITLE: Independent test design, ACD implementation, dual review, and flow documentation
+#+AUTHOR: Tim Hawes <trhawes@gmail.com>
+#+OPTIONS: toc:3 num:nil
+#+PROPERTY: header-args :tangle yes :mkdirp yes
+#+startup: overview
+
+* Purpose
+
+This document is a copy-ready template for a Hermes Agent development workflow in which:
+
+1. =test-designer= independently translates requirements into executable behavioral tests and proves RED.
+2. =implementer= uses ACD principles to produce the smallest coherent implementation that makes the tests GREEN.
+3. =correctness-reviewer= checks requirements, tests, coverage, and behavior.
+4. =structural-reviewer= checks duplication, contracts, schemas/specs, complexity, and maintainability.
+5. =flow-documenter= documents the final approved runtime flow in Draw.io.
+
+The two reviewers form a fail-closed AND gate. Neither reviewer may edit files. Each implementation slice must pass that gate, but =flow-documenter= runs only once: after every planned slice is complete and both reviewers approve the final integrated revision. The overall task is complete only when that final flow documentation is complete.
+
+Unlike the companion Claude Code workflow, Hermes agents are independent =hermes chat= processes that do not share conversational context. All communication flows through committed artifacts on disk. Each agent can run with its own model, provider, turn budget, and toolset — configured in a single YAML file.
+
+* Installation map
+
+Tangling this document generates the following files:
+
+#+begin_example
+.hermes/
+└── pipeline/
+    ├── config.yaml
+    ├── prompts/
+    │   ├── test-designer.md
+    │   ├── implementer.md
+    │   ├── correctness-reviewer.md
+    │   ├── structural-reviewer.md
+    │   └── flow-documenter.md
+    ├── orchestrator.py
+    └── workflow/
+        └── current.template.md
+.ai/
+├── workflow/
+│   └── <current.md: runtime, never tangled>
+├── test-plan.md
+├── implementation-report.md
+└── reviews/
+    ├── correctness.md
+    └── structural.md
+docs/
+└── <feature>-flow.drawio
+#+end_example
+
+* Operating model
+
+#+begin_example
+Requirements and planned slices
+              │
+              ▼
+  ┌──── repeat for each slice ────┐
+  │ test-designer → verified RED  │
+  │              │                │
+  │              ▼                │
+  │ implementer + ACD → GREEN     │
+  │              │                │
+  │              ▼                │
+  │ correctness + structural      │
+  │ reviewers → dual approval     │
+  └──────────────┬────────────────┘
+                 │ all slices complete and
+                 │ final revision approved
+                 │
+                 ▼
+          flow-documenter (once)
+                 │
+                 └── docs/<feature>-flow.drawio
+#+end_example
+
+Reviewers may run concurrently after implementation, but they must receive the original requirements before the implementation report so the implementer's narrative does not define correctness. Concurrent reviewer execution requires =--worktree= isolation; sequential execution is safe on the shared working tree.
+
+The orchestrator (=orchestrator.py= or an =execute_code= block) coordinates all stages. It never pipes raw agent output into the next agent — only committed files and written artifacts. Every agent invocation captures exit status, stdout, stderr, and elapsed time.
+
+* Copy into config.yaml
+
+#+begin_src yaml :tangle .hermes/pipeline/config.yaml
+# Per-agent model configuration.
+# Each agent: provider, model, max_turns, optional run_budget (seconds),
+# optional toolsets (comma-separated override), optional reasoning level.
+# Omit an agent to inherit the session defaults.
+# Prompts are in prompts/<role>.md — tune them when switching models.
+
+agents:
+  test-designer:
+    provider: openrouter
+    model: deepseek/deepseek-v4-flash
+    max_turns: 80
+    run_budget: 300
+  implementer:
+    provider: openrouter
+    model: deepseek/deepseek-v4-pro
+    max_turns: 150
+    run_budget: 900
+    reasoning: medium
+  correctness-reviewer:
+    provider: openrouter
+    model: anthropic/claude-sonnet-5
+    max_turns: 60
+    run_budget: 600
+    toolsets: "read,terminal,search,web,session_search"
+  structural-reviewer:
+    provider: openrouter
+    model: anthropic/claude-sonnet-5
+    max_turns: 60
+    run_budget: 600
+    toolsets: "read,terminal,search,web,session_search"
+  flow-documenter:
+    provider: openrouter
+    model: deepseek/deepseek-v4-flash
+    max_turns: 40
+    run_budget: 300
+
+settings:
+  max_review_rounds: 5
+  agent_timeout_seconds: 900
+  reviewer_parallel: false   # set true for concurrent reviewers (requires --worktree)
+#+end_src
+
+* Copy into =test-designer.md=
+
+#+begin_src markdown :tangle .hermes/pipeline/prompts/test-designer.md
+You are the independent Test Designer. Convert the original requirements into executable behavioral evidence before production implementation begins.
+
+Read, in order:
+1. the original requirements;
+2. `.ai/workflow/current.md` if present;
+3. existing tests and test conventions;
+4. nearby production interfaces only as needed to design externally meaningful tests.
+
+Before adding anything, search the repository for reusable fixtures, factories, mocks, fakes, helpers, builders, test containers, and harnesses. Reuse or extend them when coherent. Do not introduce duplicated test infrastructure or brittle implementation-detail coupling.
+
+Write focused behavioral/acceptance tests for:
+- every stated requirement and acceptance criterion;
+- material boundary values and failure paths;
+- calculations and business rules where errors would be meaningful;
+- data-contract behavior visible at important boundaries.
+
+Do not attempt exhaustive low-level unit testing and do not dictate private implementation structure. The implementer may add local unit tests later.
+
+You may modify tests and shared test-support code. You must not modify production implementation files or implement missing production behavior. If a test cannot be written without a production API decision that materially changes public behavior or architecture, stop and report the decision instead of inventing it.
+
+Run the smallest relevant test command and demonstrate RED. A valid RED is a clean assertion or behavior failure attributable to the missing requirement. Syntax errors, missing dependencies, broken fixtures, test-discovery failures, and unrelated failures are invalid; repair test infrastructure and rerun until the intended failure is observed.
+
+Write `.ai/test-plan.md` with:
+- requirement identifier and summary;
+- requirement-to-test mapping with file and test name;
+- edge and failure cases;
+- reused or extended test infrastructure;
+- exact command run and concise RED evidence;
+- intentionally uncovered behavior and rationale;
+- assumptions, ambiguities, and blockers.
+
+Update your stage in `.ai/workflow/current.md`. Stop at verified RED. Return a concise handoff naming the artifacts and the intended failing behavior; do not declare implementation complete.
+#+end_src
+
+* Copy into =implementer.md=
+
+The implementer's ACD guidance is maintained as a living Markdown prompt in =prompts/prompt_from_6.md=. The named reader block makes that external file available to noweb during tangling, while the include directive renders the same source in exported versions of this document.
+
+#+name: latest-acd-prompt
+#+begin_src emacs-lisp :var path="prompts/prompt_from_6.md" :results value raw :tangle no :exports none
+(let ((prompt-file
+       (expand-file-name path
+                         (file-name-directory (buffer-file-name)))))
+  (unless (file-readable-p prompt-file)
+    (error "Living ACD prompt is missing or unreadable: %s" prompt-file))
+  (with-temp-buffer
+    (insert-file-contents prompt-file)
+    (buffer-string)))
+#+end_src
+
+#+begin_src markdown :tangle .hermes/pipeline/prompts/implementer.md :noweb yes
+You are the Implementer. Make the independently designed behavioral tests pass with the smallest coherent production change satisfying the original requirements.
+
+Read the original requirements, `.ai/workflow/current.md`, `.ai/test-plan.md`, the failing tests, and relevant existing code. Confirm the recorded RED failure before changing production behavior.
+
+Apply the following living Action / Calculation / Data guidance:
+
+<<latest-acd-prompt()>>
+
+## Workflow-specific implementation constraints
+
+Never delete, skip, weaken, or rewrite an independent behavioral test merely to get GREEN. If a test contradicts the requirement or encodes an invalid assumption, stop and report the exact test, requirement, conflict, and proposed resolution to the orchestrator.
+
+Coverage and contract requirements:
+- Give calculation and business-rule functions meaningful behavioral coverage, including important branches and boundary cases. Raw line coverage alone is insufficient.
+- Add implementation-specific unit tests when they add confidence without coupling to incidental structure.
+- Give data crossing meaningful external, persistence, API, event, or domain boundaries an explicit contract.
+- In Clojure, use `clojure.spec` or the repository's established schema library. Do not spec every trivial local value.
+- In other languages, use the repository's established type, schema, or validation mechanism.
+- Validate at boundaries and provide useful failure information.
+
+Search the repository before introducing helpers, abstractions, schemas/specs, or test infrastructure. Remove duplication only when the shared concept is stable and the result is clearer.
+
+Run the focused tests during development, then the complete relevant suite, linters/static checks, and the repository's coverage command when available. Do not claim GREEN if unrelated relevant tests fail.
+
+Write `.ai/implementation-report.md` with:
+- requirement and revision/diff reviewed;
+- files changed and why;
+- test and check commands with results;
+- meaningful coverage for calculation/business logic;
+- specs, schemas, types, or validators added/changed;
+- existing code reused and duplication considered;
+- assumptions, risks, and unresolved issues.
+
+Update `.ai/workflow/current.md`. Stop at GREEN and return the review packet. Do not approve your own work and do not invoke final documentation.
+#+end_src
+
+** Living ACD prompt
+
+#+INCLUDE: "prompts/prompt_from_6.md" src markdown
+
+* Copy into =correctness-reviewer.md=
+
+#+begin_src markdown :tangle .hermes/pipeline/prompts/correctness-reviewer.md
+You are the independent Correctness Reviewer. You are read-only: do not modify files, fix findings, or expand scope.
+
+Read the original requirements before reading `.ai/implementation-report.md`. Review the exact revision recorded in `.ai/workflow/current.md` and identify if the working tree changed afterward.
+
+Inspect the requirements, `.ai/test-plan.md`, tests, implementation diff, relevant surrounding code, and test results. Run safe read-only checks and relevant tests when useful.
+
+Determine whether:
+- each requirement and acceptance criterion is represented accurately;
+- the tests prove externally meaningful behavior rather than implementation details;
+- RED evidence showed the intended missing behavior;
+- passing tests could succeed while the requirement is still violated;
+- the implementation games, special-cases, or bypasses tests;
+- edge cases, failures, and regressions are handled correctly;
+- calculation and business-rule behavior has meaningful coverage;
+- omitted coverage is justified;
+- the complete relevant suite is GREEN.
+
+## Output Format
+
+You MUST output a single JSON object wrapped in a code block, then stop. Do not write the file yourself — the orchestrator will save it. The JSON must be the LAST thing in your response.
+
+```json
+{
+  "verdict": "APPROVE",
+  "revision": "<git commit sha or dirty-tree description>",
+  "evidence": "<concise summary of what was verified>",
+  "findings": []
+}
+```
+
+Or:
+
+```json
+{
+  "verdict": "REQUEST_CHANGES",
+  "revision": "<git commit sha or dirty-tree description>",
+  "evidence": "<summary>",
+  "findings": [
+    {
+      "id": "C1",
+      "owner": "test-designer",
+      "requirement": "<the requirement or invariant>",
+      "location": "<file:line or description>",
+      "evidence": "<concrete evidence and reproduction command>",
+      "why": "<why it matters>",
+      "required_outcome": "<what must change, without prescribing implementation>"
+    }
+  ]
+}
+```
+
+Allowed values for `verdict`: `"APPROVE"` or `"REQUEST_CHANGES"`.
+Allowed values for `owner`: `"test-designer"`, `"implementer"`, or `"both"`.
+
+If required inputs are missing, tests cannot run, the reviewed revision is unclear, or your output cannot be completed, return `REQUEST_CHANGES`; never approve by omission.
+#+end_src
+
+* Copy into =structural-reviewer.md=
+
+#+begin_src markdown :tangle .hermes/pipeline/prompts/structural-reviewer.md
+You are the independent Structural Reviewer. You are read-only: do not modify files, fix findings, or expand scope.
+
+Read the original requirements before reading `.ai/implementation-report.md`. Review the exact revision recorded in `.ai/workflow/current.md` and identify if the working tree changed afterward.
+
+Inspect the diff and actively search the wider repository for structurally similar production code and test infrastructure. Do not limit duplication review to identical text.
+
+Determine whether:
+- new code duplicates an existing concept, function, module, schema/spec, fixture, factory, helper, mock, or harness;
+- a proposed abstraction represents a stable shared concept rather than superficial similarity;
+- ACD boundaries are clear and responsibilities sit with the correct component;
+- composition is favored over unnecessary branching or indirection;
+- the implementation introduces speculative abstractions or accidental complexity;
+- meaningful data boundaries have appropriate contracts;
+- Clojure data uses `clojure.spec` or the established schema mechanism where appropriate;
+- other languages use established type/schema/validation mechanisms;
+- validation occurs at useful boundaries rather than indiscriminately;
+- naming, cohesion, coupling, error handling, and maintainability fit repository conventions;
+- tests and production changes leave dead code or obsolete paths.
+
+## Output Format
+
+You MUST output a single JSON object wrapped in a code block, then stop. Do not write the file yourself — the orchestrator will save it. The JSON must be the LAST thing in your response.
+
+```json
+{
+  "verdict": "APPROVE",
+  "revision": "<git commit sha or dirty-tree description>",
+  "evidence": "<concise summary including repository searches performed>",
+  "findings": []
+}
+```
+
+Or:
+
+```json
+{
+  "verdict": "REQUEST_CHANGES",
+  "revision": "<git commit sha or dirty-tree description>",
+  "evidence": "<summary>",
+  "findings": [
+    {
+      "id": "S1",
+      "owner": "implementer",
+      "location": "<file:line or description>",
+      "duplicate_of": "<the duplicated or problematic structure and its repository counterpart>",
+      "evidence": "<concrete evidence>",
+      "why": "<why it matters>",
+      "required_outcome": "<what must change and the relevant architectural constraint>"
+    }
+  ]
+}
+```
+
+Allowed values for `verdict`: `"APPROVE"` or `"REQUEST_CHANGES"`.
+Allowed values for `owner`: `"test-designer"`, `"implementer"`, or `"both"`.
+
+Do not demand abstraction solely because two snippets look alike. If required inputs are missing, the reviewed revision is unclear, or your output cannot be completed, return `REQUEST_CHANGES`; never approve by omission.
+#+end_src
+
+* Copy into =flow-documenter.md=
+
+#+begin_src markdown :tangle .hermes/pipeline/prompts/flow-documenter.md
+You are the Flow Documenter. Run exactly once for the overall task, only after every planned implementation slice is complete and both reviewers have approved the same final integrated revision. Never run merely because an individual slice was approved.
+
+Before writing, verify `.ai/workflow/current.md`, `.ai/reviews/correctness.md`, and `.ai/reviews/structural.md`. Confirm that no planned slice remains incomplete and that both review artifacts explicitly approve the final integrated revision. If slice completion evidence or approvals are absent, malformed, stale, or name a different revision, stop without changing documentation.
+
+Read the final implementation itself. Planning notes and implementation reports are navigation aids, not architectural truth.
+
+Create or update `docs/<feature>-flow.drawio` as valid, editable Draw.io XML. Show, at function/component-flow level:
+- externally callable entry points and triggers;
+- major function or component calls;
+- material decision points and branches;
+- important data transformations and contract boundaries;
+- persistence, queues, APIs, and other external systems;
+- significant failure, retry, and error paths;
+- concise labels that match code names where useful.
+
+Keep the diagram readable. Do not create a line-by-line call graph or document speculative future architecture. Preserve unrelated existing diagram content when updating a shared file.
+
+Validate that the `.drawio` file opens or parses with the project's available tooling. Record the diagram path, approved revision, validation performed, and any intentionally omitted detail in `.ai/workflow/current.md`. Mark documentation complete and return a concise handoff.
+#+end_src
+
+* Copy into =orchestrator.py=
+
+The orchestrator is a standalone Python script. Run it with =python .hermes/pipeline/orchestrator.py= or as an =execute_code= block inside Hermes. =PIPELINE_REQUIREMENTS_FILE= is mandatory (path to a requirements document relative to the project root). =PIPELINE_PROJECT= defaults to the current working directory. =PIPELINE_FEATURE= defaults to the requirements filename without extension.
+
+Each agent runs as an independent =hermes chat= process. The orchestrator writes the prompt to a temp file (passed via =--query-file= — never shell-interpolated), spawns the process, captures exit code / stdout / stderr / elapsed time, and validates that the required artifact exists before proceeding to the next stage.
+
+Reviewer verdicts are parsed from JSON code blocks. Malformed, missing, or non-JSON output is treated as =REQUEST_CHANGES= (fail closed). Verdicts are validated against the expected git revision to prevent stale approvals.
+
+#+begin_src python :tangle .hermes/pipeline/orchestrator.py
+"""ACD Pipeline Orchestrator for Hermes Agent.
+
+PIPELINE_REQUIREMENTS_FILE=docs/spec.md python .hermes/pipeline/orchestrator.py
+
+PIPELINE_REQUIREMENTS_FILE (mandatory) — path to a requirements doc, relative
+    to the project root.
+PIPELINE_PROJECT (optional) — project directory. Defaults to CWD.
+PIPELINE_FEATURE (optional) — short label. Defaults to the requirements
+    filename without extension.
+
+Or inside a Hermes execute_code block — the hermes_tools import works there.
+"""
+
+from hermes_tools import terminal, read_file, write_file
+import json, re, tempfile, os, time, subprocess, sys
+
+try:
+    import yaml
+except ImportError:
+    print("yaml not available — install pyyaml or use execute_code")
+    sys.exit(1)
+
+
+# ── Configuration ──
+
+PROJECT = os.path.abspath(os.environ.get("PIPELINE_PROJECT", "."))
+
+reqs_file = os.environ.get("PIPELINE_REQUIREMENTS_FILE", "")
+if not reqs_file:
+    print("PIPELINE_REQUIREMENTS_FILE is required", file=sys.stderr)
+    sys.exit(1)
+reqs_path = os.path.join(PROJECT, reqs_file)
+with open(reqs_path) as f:
+    REQUIREMENTS = f.read()
+
+FEATURE = os.environ.get("PIPELINE_FEATURE", "")
+if not FEATURE:
+    FEATURE = os.path.splitext(os.path.basename(reqs_file))[0]
+
+CONFIG_PATH = f"{PROJECT}/.hermes/pipeline/config.yaml"
+with open(CONFIG_PATH) as f:
+    config = yaml.safe_load(f)
+
+AGENTS = config["agents"]
+SETTINGS = config.get("settings", {})
+
+
+# ── Agent Runner ──
+
+def run_agent(role, task, extra_context="", worktree=False):
+    """Spawn a Hermes agent as an independent process.
+
+    Returns dict with exit_code, stdout, stderr, elapsed_s, success, timeout.
+    """
+    cfg = AGENTS.get(role, {})
+    model = cfg.get("model")
+    provider = cfg.get("provider")
+    max_turns = cfg.get("max_turns", 100)
+    run_budget = cfg.get("run_budget")
+    reasoning = cfg.get("reasoning")
+    toolsets = cfg.get("toolsets")
+    timeout = SETTINGS.get("agent_timeout_seconds", 900)
+
+    # Load role prompt
+    prompt_file = f"{PROJECT}/.hermes/pipeline/prompts/{role}.md"
+    with open(prompt_file) as f:
+        system_prompt = f.read()
+
+    full_prompt = f"""{system_prompt}
+
+## Task
+{task}
+
+## Context
+Project: {PROJECT}
+Feature: {FEATURE}
+{extra_context}
+"""
+
+    # Write prompt to temp file — safe: no shell interpolation
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tf:
+        tf.write(full_prompt)
+        prompt_path = tf.name
+
+    cmd = ["hermes", "chat", "--query-file", prompt_path,
+           "--oneshot", "-Q", "--in", PROJECT,
+           "--max-turns", str(max_turns)]
+    if model:
+        cmd.extend(["--model", model])
+    if provider:
+        cmd.extend(["--provider", provider])
+    if run_budget:
+        cmd.extend(["--run-budget", str(run_budget)])
+    if reasoning:
+        cmd.extend(["--reasoning", reasoning])
+    if toolsets:
+        cmd.extend(["--toolsets", toolsets])
+    if worktree:
+        cmd.append("--worktree")
+
+    t0 = time.monotonic()
+    result = terminal(command=subprocess.list2cmdline(cmd), timeout=timeout, workdir=PROJECT)
+    elapsed = time.monotonic() - t0
+
+    try:
+        os.unlink(prompt_path)
+    except OSError:
+        pass
+
+    return {
+        "role": role,
+        "exit_code": result.get("exit_code"),
+        "stdout": result.get("output", ""),
+        "stderr": result.get("error", "") if isinstance(result.get("error"), str) else "",
+        "elapsed_s": round(elapsed, 1),
+        "timeout": result.get("exit_code") == 124,
+        "success": result.get("exit_code") == 0,
+    }
+
+
+# ── Review Verdict Parser ──
+
+def parse_review_json(filepath):
+    """Extract JSON verdict from a review artifact file.
+
+    Returns parsed dict, or None if unparseable.
+    """
+    content = read_file(filepath).get("content", "")
+    if not content:
+        return None
+
+    # Try fenced JSON code block first
+    m = re.search(r'```(?:json)?\s*\n(.*?)\n```', content, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: find a JSON object containing "verdict"
+    m = re.search(r'\{[^{}]*"verdict"[^{}]*\}', content)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def validate_verdict(verdict, expected_revision):
+    """Check verdict is well-formed and targets the correct revision."""
+    if verdict is None:
+        return {"valid": False, "reason": "unparseable output"}
+    if "verdict" not in verdict:
+        return {"valid": False, "reason": "missing 'verdict' key"}
+    if verdict["verdict"] not in ("APPROVE", "REQUEST_CHANGES"):
+        return {"valid": False, "reason": f"invalid verdict value: {verdict['verdict']}"}
+    if verdict.get("revision") != expected_revision:
+        return {"valid": False, "reason":
+                f"revision mismatch: {verdict.get('revision')} vs {expected_revision}"}
+    return {"valid": True, "verdict": verdict["verdict"],
+            "findings": verdict.get("findings", [])}
+
+
+# ── Artifact Verifiers ──
+
+class StageFailed(Exception):
+    pass
+
+
+def verify_artifact(path, description):
+    if not os.path.exists(path):
+        raise StageFailed(f"{description} not found: {path}")
+    if os.path.getsize(path) == 0:
+        raise StageFailed(f"{description} is empty: {path}")
+    print(f"  OK: {description}")
+
+
+# ── Pipeline ──
+
+def run_pipeline():
+    print(f"Pipeline: {FEATURE}")
+    print(f"Project:  {PROJECT}")
+    print(f"Config:   {CONFIG_PATH}")
+    print()
+
+    # ── Stage 1: Test Design ──
+    print("─── Stage 1: Test Design ───")
+    td = run_agent("test-designer",
+        f"Convert these requirements into behavioral tests and prove RED:\n\n{REQUIREMENTS}")
+    _report_agent(td)
+    if not td["success"]:
+        raise StageFailed("test-designer failed")
+    verify_artifact(f"{PROJECT}/.ai/test-plan.md", "test plan")
+
+    # ── Stage 2: Implementation ──
+    print()
+    print("─── Stage 2: Implementation ───")
+    impl = run_agent("implementer",
+        f"Make the tests GREEN.\n\nOriginal requirements:\n{REQUIREMENTS}")
+    _report_agent(impl)
+    if not impl["success"]:
+        raise StageFailed("implementer failed")
+    verify_artifact(f"{PROJECT}/.ai/implementation-report.md", "implementation report")
+
+    # ── Stage 3: Reviews (sequential by default; add worktree=True for parallel) ──
+    review_round = 0
+    max_rounds = SETTINGS.get("max_review_rounds", 5)
+    current_revision = _get_revision()
+
+    while review_round < max_rounds:
+        review_round += 1
+        print()
+        print(f"─── Stage 3: Review Round {review_round}/{max_rounds} ───")
+
+        print("  Correctness review...")
+        cr = run_agent("correctness-reviewer",
+            f"Review correctness.\n\nOriginal requirements:\n{REQUIREMENTS}",
+            worktree=SETTINGS.get("reviewer_parallel", False))
+        _report_agent(cr)
+
+        print("  Structural review...")
+        sr = run_agent("structural-reviewer",
+            f"Review structure.\n\nOriginal requirements:\n{REQUIREMENTS}",
+            worktree=SETTINGS.get("reviewer_parallel", False))
+        _report_agent(sr)
+
+        # Parse verdicts
+        verify_artifact(f"{PROJECT}/.ai/reviews/correctness.md", "correctness review")
+        verify_artifact(f"{PROJECT}/.ai/reviews/structural.md", "structural review")
+
+        cr_json = parse_review_json(f"{PROJECT}/.ai/reviews/correctness.md")
+        sr_json = parse_review_json(f"{PROJECT}/.ai/reviews/structural.md")
+
+        cr_valid = validate_verdict(cr_json, current_revision)
+        sr_valid = validate_verdict(sr_json, current_revision)
+
+        for label, result in [("Correctness", cr_valid), ("Structural", sr_valid)]:
+            if result["valid"]:
+                print(f"  {label}: {result['verdict']} ({len(result['findings'])} findings)")
+            else:
+                print(f"  {label}: FAILED — {result['reason']}")
+
+        if all(v["valid"] and v["verdict"] == "APPROVE" for v in [cr_valid, sr_valid]):
+            print()
+            print("═══ DUAL APPROVAL — slice complete ═══")
+            return True
+
+        # Route findings to owners
+        all_findings = cr_valid.get("findings", []) + sr_valid.get("findings", [])
+        owners = set(f.get("owner") for f in all_findings if f.get("owner"))
+        print(f"  Findings require changes from: {owners or 'unknown'}")
+
+        # If test changes needed, re-run test-designer then implementer
+        if "test-designer" in owners or "both" in owners:
+            print("  → Re-running test-designer...")
+            td = run_agent("test-designer",
+                f"Address review findings and re-establish RED.\n\nFindings:\n"
+                f"{json.dumps(all_findings, indent=2)}\n\n"
+                f"Original requirements:\n{REQUIREMENTS}")
+            _report_agent(td)
+
+        if "implementer" in owners or "both" in owners or "test-designer" in owners:
+            print("  → Re-running implementer...")
+            impl = run_agent("implementer",
+                f"Address review findings and re-establish GREEN.\n\nFindings:\n"
+                f"{json.dumps(all_findings, indent=2)}\n\n"
+                f"Original requirements:\n{REQUIREMENTS}")
+            _report_agent(impl)
+
+        current_revision = _get_revision()
+
+    raise StageFailed(f"Exceeded {max_rounds} review rounds without dual approval")
+
+
+def _report_agent(result):
+    status = "OK" if result["success"] else ("TIMEOUT" if result["timeout"] else "FAILED")
+    print(f"  [{status}] {result['role']}: exit={result['exit_code']} "
+          f"elapsed={result['elapsed_s']}s")
+    if not result["success"]:
+        stderr_preview = result["stderr"][:200] if result["stderr"] else "(no stderr)"
+        print(f"         stderr: {stderr_preview}")
+
+
+def _get_revision():
+    result = terminal(command="git rev-parse HEAD", workdir=PROJECT)
+    return result["output"].strip()[:8] if result.get("exit_code") == 0 else "unknown"
+
+
+# ── Entry Point ──
+
+if __name__ == "__main__":
+    try:
+        run_pipeline()
+    except StageFailed as e:
+        print()
+        print(f"PIPELINE ABORTED: {e}")
+        sys.exit(1)
+#+end_src
+
+* Durable workflow state template
+
+The tangled template is maintained by this document. The orchestrator initializes =.ai/workflow/current.md= from it only when =current.md= does not already exist. A per-feature runtime filename such as =.ai/workflow/JIRA-1234.md= is preferable when several workflows may run concurrently.
+
+#+name: workflow-state-template
+#+begin_src markdown :tangle .hermes/pipeline/workflow/current.template.md
+# Workflow state: <requirement-id or feature>
+
+- Requirement source: <URL, issue, or verbatim text>
+- Started: <ISO-8601 timestamp>
+- Current revision: <git commit plus dirty-state note>
+- Review round: 0 of 5
+- Planned slices: <ordered list or stable plan reference>
+- Current slice: <name, number, or "final integration">
+- Next action: <specific action>
+
+| Stage | Status | Artifact / evidence |
+|---|---|---|
+| Test design | NOT_STARTED | `.ai/test-plan.md` |
+| RED verified | NOT_STARTED | command + intended failure |
+| Implementation | NOT_STARTED | `.ai/implementation-report.md` |
+| Relevant suite GREEN | NOT_STARTED | command + result |
+| Correctness review | NOT_STARTED | `.ai/reviews/correctness.md` |
+| Structural review | NOT_STARTED | `.ai/reviews/structural.md` |
+| Final revision approval | NOT_STARTED | both review artifacts approve current integrated revision |
+| Final flow documentation (run once) | NOT_STARTED | `docs/<feature>-flow.drawio` |
+
+## Review target
+
+- Commit: <sha>
+- Dirty diff fingerprint or summary: <value>
+- Tests/checks: <commands and results>
+
+## Open findings
+
+| ID | Reviewer | Owner | Status | Summary | Evidence |
+|---|---|---|---|---|---|
+
+## Decisions, assumptions, and blockers
+
+- <item or "none">
+
+## Handoff history
+
+- <timestamp> — <agent/stage> — <result and artifact>
+#+end_src
+
+* Reviewer verdict contract
+
+** JSON schema
+
+Every reviewer must output a single JSON object as the final content before exit. The orchestrator parses this JSON mechanically — it never scans prose for verdicts.
+
+#+begin_src json
+{
+  "verdict": "APPROVE | REQUEST_CHANGES",
+  "revision": "<git sha>",
+  "evidence": "<concise summary of what was verified>",
+  "findings": [
+    {
+      "id": "C1",
+      "owner": "test-designer | implementer | both",
+      "requirement": "<requirement text or invariant>",
+      "location": "<file:line>",
+      "evidence": "<concrete observation or reproduction command>",
+      "why": "<why it matters>",
+      "required_outcome": "<outcome, not prescribed implementation>"
+    }
+  ]
+}
+#+end_src
+
+** Rules
+
+- =verdict= is required. =APPROVE= only when =findings= contains no blocking items.
+- =revision= is required. If it does not match the orchestrator's expected revision, the verdict is stale and treated as =REQUEST_CHANGES=.
+- =findings= may be empty (clean approval). Every finding must include all fields.
+- Structural reviewers must also include =duplicate_of= in findings when applicable.
+- Malformed, missing, or non-JSON output is =REQUEST_CHANGES= — fail closed.
+
+** Verdict examples
+
+Clean approval:
+#+begin_src json
+{
+  "verdict": "APPROVE",
+  "revision": "abc1234f",
+  "evidence": "All 12 tests pass. Each requirement has coverage. RED was verified before implementation. No test games or bypasses detected.",
+  "findings": []
+}
+#+end_src
+
+Changes requested:
+#+begin_src json
+{
+  "verdict": "REQUEST_CHANGES",
+  "revision": "abc1234f",
+  "evidence": "3 requirements have gaps. See findings.",
+  "findings": [
+    {
+      "id": "C1",
+      "owner": "implementer",
+      "requirement": "Users must receive a confirmation email after registration",
+      "location": "src/auth/handler.ts:142",
+      "evidence": "Email is logged but never sent. No SMTP call in the execution trace.",
+      "why": "The acceptance criterion 'confirmation email sent' is not satisfied.",
+      "required_outcome": "Send email via the established mail service at the documented boundary"
+    }
+  ]
+}
+#+end_src
+
+* Review and repair protocol
+
+** Verdict contract
+
+Each reviewer output is parsed as JSON. The following outcomes are possible:
+
+| Output | Treatment |
+|--------+-----------|
+| Valid JSON, =verdict: APPROVE=, matching revision | APPROVE |
+| Valid JSON, =verdict: APPROVE=, wrong revision | REQUEST_CHANGES (stale) |
+| Valid JSON, =verdict: REQUEST_CHANGES= | REQUEST_CHANGES |
+| Malformed JSON | REQUEST_CHANGES |
+| No JSON found | REQUEST_CHANGES |
+| Missing artifact file | REQUEST_CHANGES |
+| Agent exit != 0, timeout, or no output | REQUEST_CHANGES |
+
+An approval is valid only when it names the exact revision under review. Missing, timed-out, crashed, ambiguous, or contradictory output is =REQUEST_CHANGES=.
+
+** Routing matrix
+
+| Finding | Primary owner | Required replay |
+|---|---|---|
+| Requirement encoded incorrectly or incompletely in tests | test-designer | RED → implementer GREEN → both reviews |
+| Duplicated fixture/helper/harness | test-designer | RED if behavior changes → GREEN → both reviews |
+| Production behavior defect | implementer | GREEN → both reviews |
+| Missing calculation/business coverage | test-designer for behavioral gap; implementer for local unit gap | RED when behavioral test changes → GREEN → both reviews |
+| Missing or incorrect schema/spec/contract | implementer | GREEN → both reviews |
+| Production duplication or misplaced abstraction | implementer | GREEN → both reviews |
+| Cross-cutting mismatch between test contract and implementation boundary | both, test designer first | RED → GREEN → both reviews |
+
+Reviewers do not repair their own findings. After any test or code change, previous approvals are stale. Both reviewers inspect the complete new revision; approval cannot be patched forward from an older diff.
+
+* Model selection strategy
+
+Different models have different tool-use reliability, context-window size, and reasoning depth. Assign models to roles based on their characteristics:
+
+| Role | Needs | Suggested tier | Example models |
+|------+-------+----------------+----------------|
+| test-designer | Code generation, test patterns, tool use | Mid-tier | deepseek-v4-flash, claude-haiku, gpt-4o-mini |
+| implementer | Deep reasoning, ACD refactoring, multi-file edits | Strong | deepseek-v4-pro, claude-sonnet-4, gpt-4o |
+| correctness-reviewer | Thorough analysis, edge cases, large context | Strong | claude-sonnet-4, gpt-4o, deepseek-v4-pro |
+| structural-reviewer | Pattern matching, codebase search, large context | Strong | claude-sonnet-4, gpt-4o, deepseek-v4-pro |
+| flow-documenter | Diagram generation, documentation | Mid-tier | deepseek-v4-flash, claude-haiku |
+
+When switching a role's model:
+
+1. *Context window*: Smaller windows need trimmed context-injection instructions.
+2. *Tool reliability*: Flash/light models may need more explicit tool-use guidance.
+3. *Reasoning depth*: Pro/opus models handle open-ended analysis; flash models need more structure.
+4. *JSON compliance*: Reviewers on weaker models may need explicit JSON schemas in their prompts. If a model consistently produces malformed JSON, demote it from reviewer roles.
+
+* Definition of done
+
+A workflow is done only when all statements are true:
+
+- Original requirements are durably recorded.
+- Independent behavioral tests map to requirements.
+- RED was observed for the intended missing behavior.
+- Relevant tests and checks are GREEN after implementation.
+- Calculation/business behavior has meaningful coverage.
+- Important data boundaries have appropriate specs, schemas, types, or validation.
+- Test and production duplication were actively searched for and addressed appropriately.
+- Correctness and structural reviewers approved the same current revision via valid JSON.
+- No code changed after those approvals.
+- The Draw.io diagram represents the final approved implementation and was validated.
+- Durable workflow state records artifacts, commands, verdicts, decisions, and completion.
+
+* Setup checklist
+
+1. Run =org-babel-tangle=. It generates all =hermes_pipeline/= files.
+2. Ensure each configured model is available via the declared provider.
+3. Edit =.hermes/pipeline/config.yaml= to match the project's model preferences and turn budgets.
+4. Verify =hermes chat --help= confirms =--query-file=, =--oneshot=, =--worktree=, =--run-budget=, =--reasoning=, =--toolsets= are accepted.
+5. Pilot on a small behavior change and inspect RED evidence, JSON verdicts, routing, dual approvals, and Draw.io output before broad adoption.
+6. For parallel reviewer execution, set =reviewer_parallel: true= in config — reviewers will auto-isolate via =--worktree=.
+
+* Sources and version notes
+
+This template was checked on 2026-09-04 against:
+
+- Hermes Agent: https://github.com/NousResearch/hermes-agent
+- Hermes delegation docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/delegation
+- Claude Code workflow (companion): =README.org= in this repository
+- ACD principles: Eric Normand's /Grokking Simplicity/ (=prompts/prompt_from_6.md=)
+
+Hermes Agent evolves. Recheck supported flags, tool names, and delegation behavior when adopting this later. The workflow's separation of responsibilities, JSON verdict contract, and review gates remain valid even if configuration syntax changes.
