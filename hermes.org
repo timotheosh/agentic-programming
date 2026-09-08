@@ -383,13 +383,34 @@ PIPELINE_FEATURE (optional) — short label. Defaults to the requirements
 Or inside a Hermes execute_code block — the hermes_tools import works there.
 """
 
-from hermes_tools import terminal, read_file, write_file
+# ── Hermes tools (importable inside execute_code; stdlib fallback otherwise) ──
+
+try:
+    from hermes_tools import terminal, read_file, write_file
+except ImportError:
+    # Standalone fallback — same signatures as hermes_tools.
+    def terminal(command, timeout=None, workdir=None):
+        result = subprocess.run(command, shell=True, capture_output=True,
+                                text=True, timeout=timeout, cwd=workdir)
+        return {"exit_code": result.returncode,
+                "output": result.stdout,
+                "error": result.stderr}
+
+    def read_file(path):
+        with open(path) as f:
+            return {"content": f.read()}
+
+    def write_file(path, content):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+
 import json, re, tempfile, os, time, subprocess, sys
 
 try:
     import yaml
 except ImportError:
-    print("yaml not available — install pyyaml or use execute_code")
+    print("yaml not available — install pyyaml or use execute_code", file=sys.stderr)
     sys.exit(1)
 
 
