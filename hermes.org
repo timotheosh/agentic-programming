@@ -75,7 +75,7 @@ Requirements and planned slices
 
 Reviewers may run concurrently after implementation, but they must receive the original requirements before the implementation report so the implementer's narrative does not define correctness. Concurrent reviewer execution requires =--worktree= isolation; sequential execution is safe on the shared working tree.
 
-The orchestrator (=orchestrator.py= or an =execute_code= block) coordinates all stages. It never pipes raw agent output into the next agent — only committed files and written artifacts. Every agent invocation captures exit status, stdout, stderr, and elapsed time.
+The standalone Python orchestrator (=orchestrator.py=) coordinates all stages. It never pipes raw agent output into the next agent — only committed files and written artifacts. Every agent invocation captures exit status, stdout, stderr, and elapsed time.
 
 * Copy into config.yaml
 
@@ -363,7 +363,7 @@ Validate that the `.drawio` file opens or parses with the project's available to
 
 * Copy into =orchestrator.py=
 
-The orchestrator is a standalone Python script. Run it with =python .hermes/pipeline/orchestrator.py= or as an =execute_code= block inside Hermes. =PIPELINE_REQUIREMENTS_FILE= is mandatory (path to a requirements document relative to the project root). =PIPELINE_PROJECT= defaults to the current working directory. =PIPELINE_FEATURE= defaults to the requirements filename without extension.
+The orchestrator is a standalone Python script. Run it with =python .hermes/pipeline/orchestrator.py docs/spec.md=. The requirements file is a mandatory positional CLI argument, resolved relative to the project root unless absolute. =--project= defaults to =PIPELINE_PROJECT= or the current working directory. =--feature= defaults to =PIPELINE_FEATURE= or the requirements filename without extension. Python, PyYAML, Git, and the =hermes= CLI are required.
 
 Each agent runs as an independent =hermes chat= process. The orchestrator writes the prompt to a temp file (passed via =--query-file= — never shell-interpolated), spawns the process, captures exit code / stdout / stderr / elapsed time, and validates that the required artifact exists before proceeding to the next stage.
 
@@ -372,61 +372,51 @@ Reviewer verdicts are parsed from JSON code blocks. Malformed, missing, or non-J
 #+begin_src python :tangle .hermes/pipeline/orchestrator.py
 """ACD Pipeline Orchestrator for Hermes Agent.
 
-PIPELINE_REQUIREMENTS_FILE=docs/spec.md python .hermes/pipeline/orchestrator.py
+python .hermes/pipeline/orchestrator.py docs/spec.md
 
-PIPELINE_REQUIREMENTS_FILE (mandatory) — path to a requirements doc, relative
-    to the project root.
-PIPELINE_PROJECT (optional) — project directory. Defaults to CWD.
-PIPELINE_FEATURE (optional) — short label. Defaults to the requirements
-    filename without extension.
-
-Or inside a Hermes execute_code block — the hermes_tools import works there.
+requirements_file (mandatory CLI argument) — path to a requirements doc,
+    relative to the project root unless absolute.
+--project (optional) — project directory. Defaults to PIPELINE_PROJECT or CWD.
+--feature (optional) — short label. Defaults to PIPELINE_FEATURE or the
+    requirements filename without extension.
 """
 
-# ── Hermes tools (importable inside execute_code; stdlib fallback otherwise) ──
-
-try:
-    from hermes_tools import terminal, read_file, write_file
-except ImportError:
-    # Standalone fallback — same signatures as hermes_tools.
-    def terminal(command, timeout=None, workdir=None):
-        result = subprocess.run(command, shell=True, capture_output=True,
-                                text=True, timeout=timeout, cwd=workdir)
-        return {"exit_code": result.returncode,
-                "output": result.stdout,
-                "error": result.stderr}
-
-    def read_file(path):
-        with open(path) as f:
-            return {"content": f.read()}
-
-    def write_file(path, content):
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w") as f:
-            f.write(content)
-
-import json, re, tempfile, os, time, subprocess, sys
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
 
 try:
     import yaml
 except ImportError:
-    print("yaml not available — install pyyaml or use execute_code", file=sys.stderr)
+    print("yaml not available — install pyyaml", file=sys.stderr)
     sys.exit(1)
 
 
 # ── Configuration ──
 
-PROJECT = os.path.abspath(os.environ.get("PIPELINE_PROJECT", "."))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("requirements_file", help="requirements document, relative to project root")
+parser.add_argument("--project", default=os.environ.get("PIPELINE_PROJECT", "."))
+parser.add_argument("--feature", default=os.environ.get("PIPELINE_FEATURE", ""))
+args = parser.parse_args()
 
-reqs_file = os.environ.get("PIPELINE_REQUIREMENTS_FILE", "")
-if not reqs_file:
-    print("PIPELINE_REQUIREMENTS_FILE is required", file=sys.stderr)
-    sys.exit(1)
+PROJECT = os.path.abspath(args.project)
+reqs_file = args.requirements_file
 reqs_path = os.path.join(PROJECT, reqs_file)
-with open(reqs_path) as f:
-    REQUIREMENTS = f.read()
+try:
+    with open(reqs_path, encoding="utf-8") as f:
+        REQUIREMENTS = f.read()
+except (OSError, UnicodeError) as exc:
+    parser.error(f"cannot read requirements file {reqs_path}: {exc}")
+if not REQUIREMENTS.strip():
+    parser.error(f"requirements file is empty: {reqs_path}")
 
-FEATURE = os.environ.get("PIPELINE_FEATURE", "")
+FEATURE = args.feature
 if not FEATURE:
     FEATURE = os.path.splitext(os.path.basename(reqs_file))[0]
 
@@ -456,7 +446,7 @@ def run_agent(role, task, extra_context="", worktree=False):
 
     # Load role prompt
     prompt_file = f"{PROJECT}/.hermes/pipeline/prompts/{role}.md"
-    with open(prompt_file) as f:
+    with open(prompt_file, encoding="utf-8") as f:
         system_prompt = f.read()
 
     full_prompt = f"""{system_prompt}
@@ -471,7 +461,7 @@ Feature: {FEATURE}
 """
 
     # Write prompt to temp file — safe: no shell interpolation
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tf:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md", delete=False) as tf:
         tf.write(full_prompt)
         prompt_path = tf.name
 
@@ -492,23 +482,37 @@ Feature: {FEATURE}
         cmd.append("--worktree")
 
     t0 = time.monotonic()
-    result = terminal(command=subprocess.list2cmdline(cmd), timeout=timeout, workdir=PROJECT)
-    elapsed = time.monotonic() - t0
-
+    timed_out = False
     try:
-        os.unlink(prompt_path)
-    except OSError:
-        pass
+        result = subprocess.run(cmd, cwd=PROJECT, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        exit_code, stdout, stderr = result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired as exc:
+        exit_code, stdout, stderr = 124, _output_text(exc.stdout), _output_text(exc.stderr)
+        timed_out = True
+    except OSError as exc:
+        exit_code, stdout, stderr = None, "", str(exc)
+    finally:
+        elapsed = time.monotonic() - t0
+        try:
+            os.unlink(prompt_path)
+        except OSError:
+            pass
 
     return {
         "role": role,
-        "exit_code": result.get("exit_code"),
-        "stdout": result.get("output", ""),
-        "stderr": result.get("error", "") if isinstance(result.get("error"), str) else "",
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
         "elapsed_s": round(elapsed, 1),
-        "timeout": result.get("exit_code") == 124,
-        "success": result.get("exit_code") == 0,
+        "timeout": timed_out,
+        "success": exit_code == 0,
     }
+
+
+def _output_text(output):
+    """Normalize partial subprocess output, which can be bytes on timeout."""
+    return output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output or ""
 
 
 # ── Review Verdict Parser ──
@@ -518,7 +522,8 @@ def parse_review_json(filepath):
 
     Returns parsed dict, or None if unparseable.
     """
-    content = read_file(filepath).get("content", "")
+    with open(filepath, encoding="utf-8") as f:
+        content = f.read()
     if not content:
         return None
 
@@ -677,8 +682,9 @@ def _report_agent(result):
 
 
 def _get_revision():
-    result = terminal(command="git rev-parse HEAD", workdir=PROJECT)
-    return result["output"].strip()[:8] if result.get("exit_code") == 0 else "unknown"
+    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT,
+                            capture_output=True, text=True)
+    return result.stdout.strip()[:8] if result.returncode == 0 else "unknown"
 
 
 # ── Entry Point ──
@@ -873,12 +879,13 @@ A workflow is done only when all statements are true:
 
 * Setup checklist
 
-1. Run =org-babel-tangle=. It generates all =hermes_pipeline/= files.
+1. Run =org-babel-tangle=. It generates the =.hermes/pipeline/= files.
 2. Ensure each configured model is available via the declared provider.
 3. Edit =.hermes/pipeline/config.yaml= to match the project's model preferences and turn budgets.
 4. Verify =hermes chat --help= confirms =--query-file=, =--oneshot=, =--worktree=, =--run-budget=, =--reasoning=, =--toolsets= are accepted.
 5. Pilot on a small behavior change and inspect RED evidence, JSON verdicts, routing, dual approvals, and Draw.io output before broad adoption.
 6. For parallel reviewer execution, set =reviewer_parallel: true= in config — reviewers will auto-isolate via =--worktree=.
+7. Install PyYAML if needed (=python -m pip install pyyaml=), then launch with =python .hermes/pipeline/orchestrator.py docs/spec.md=, supplying the requirements path explicitly.
 
 * Sources and version notes
 
