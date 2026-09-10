@@ -15,9 +15,27 @@ edges.
 
 ---
 
-## 1. Domain vocabulary and identity
+## Overview
 
-### 1.1 Run, slice, iteration, step
+This design realizes requirements R-1 .. R-18 (see `doc/requirements.md`). The
+system is a data-driven state machine whose core is a pure `transition`
+calculation; durable state lives in Datalevin (LMDB/ACID) and is written as it
+happens so a halted run resumes from the last committed point; and agents are
+invoked through a `defprotocol` with hermes (confirmed) and kiro (provisional)
+backends, model defaulting to agentic `auto`. Decisions are calculations over
+immutable data (ACD); effects live in thin actions at the edges. The sections
+below are organized as Architecture (domain identity, the state machine, and
+namespace layout), Data Models (the Datalevin schema), Components and Interfaces
+(the pure core calculations and the edge actions/protocol), Correctness
+Properties (per-requirement enforcement and invariants), Error Handling
+(pipeline errors vs. interruptions and fail-closed behavior), and the Testing
+Strategy.
+
+## Architecture
+
+### Domain vocabulary and identity
+
+#### Run, slice, iteration, step
 
 - **Run** — one end-to-end execution of the workflow for a feature/requirement
   set. Identified by a **run-id** (random UUID).
@@ -46,7 +64,7 @@ edges.
 UUIDs are generated in an action (`clojure.core/random-uuid`) and passed into
 calculations as data, so the calculations remain deterministic and testable.
 
-### 1.2 Review/approval identity is the iteration (R-8, R-16)
+#### Review/approval identity is the iteration (R-8, R-16)
 
 **Reviews and approvals bind to an `iteration-id`, not to any Git-derived
 content fingerprint.** There is no git SHA, no dirty fingerprint, and no
@@ -73,9 +91,9 @@ the iteration-id.
 
 ---
 
-## 2. State machine
+### State machine
 
-### 2.1 States (per slice/iteration)
+#### States (per slice/iteration)
 
 ```
 :planning              ; run created, slices recorded, none started
@@ -105,7 +123,7 @@ event and the `:verify-green` effect produces the existing `:green` event; those
 events drive the transitions below. There are no `:red-verify` /
 `:green-verify` states.
 
-### 2.2 Transition table as data (R-4)
+#### Transition table as data (R-4)
 
 The transition function is a pure calculation driven by a data table:
 
@@ -143,7 +161,7 @@ Illegal `[state event]` pairs, malformed events, and missing data all resolve to
 silence, timeout, or malformed output (fail-closed terminology from
 requirements).
 
-### 2.3 Multimethod dispatch on effects
+#### Multimethod dispatch on effects
 
 Per the project rule (defmulti + all defmethods in the same namespace), effect
 interpretation uses a single multimethod in the orchestrator namespace:
@@ -161,7 +179,30 @@ The multimethod is the boundary where calculations meet actions.
 
 ---
 
-## 3. Datalevin schema (durable state: R-17, R-8, R-15, R-18)
+### Namespace layout
+
+```
+deps.edn
+src/workflow/core.clj          ; pure calculations: transition table, predicates
+src/workflow/store.clj         ; Datalevin: schema, connect, transact helpers, queries, event stream
+src/workflow/agents.clj        ; AgentInvoker protocol; HermesAgent; KiroAgent; argv calcs
+src/workflow/orchestrator.clj  ; drives the loop; perform-effect multimethod; resume/reconcile
+src/workflow/main.clj          ; entry point / CLI wiring
+test/workflow/core_test.clj
+test/workflow/store_test.clj
+test/workflow/agents_test.clj
+test/workflow/orchestrator_test.clj
+```
+
+`defmulti perform-effect` and all its `defmethod`s live in
+`workflow.orchestrator` (project rule: multimethod + all methods in one ns).
+There is no `workflow.git` namespace.
+
+---
+
+## Data Models
+
+### Datalevin schema (durable state: R-17, R-8, R-15, R-18)
 
 One database directory per installation (path configurable). Every meaningful
 fact is its own entity, so history is append-friendly and superseded decisions
@@ -169,7 +210,7 @@ are retained rather than overwritten. **State-machine progress is stored as an
 append-only stream of immutable transition events (S 3.1); current state is
 *derived* from the latest event, not mutated in place.**
 
-### 3.1 Transition history as immutable events (R-17)
+#### Transition history as immutable events (R-17)
 
 ```clojure
 ;; Append-only. One entity per state transition that ever occurs.
@@ -189,7 +230,7 @@ The scalar `:*/state` attributes below are a **materialized convenience** kept
 in sync by the same transaction that appends the event; the event stream is the
 source of truth and can rebuild them. Nothing overwrites history.
 
-### 3.2 Entities
+#### Entities
 
 ```clojure
 (def schema
@@ -269,7 +310,7 @@ source of truth and can rebuild them. Nothing overwrites history.
    })
 ```
 
-### 3.3 Disagreement identity is the `:disagreement/id` (R-15)
+#### Disagreement identity is the `:disagreement/id` (R-15)
 
 A disagreement's **stable identity is its `:disagreement/id`** (a UUID), and that
 identity is what carries the allowance across iterations, review rounds, and
@@ -304,7 +345,9 @@ Notes:
 
 ---
 
-## 4. Pure core calculations
+## Components and Interfaces
+
+### Pure core calculations
 
 Namespace `workflow.core` — no I/O, fully unit-testable.
 
@@ -346,14 +389,14 @@ return plain data/booleans.
 
 ---
 
-## 5. Actions and edges
+### Actions and edges
 
 Namespaces `workflow.store` (Datalevin), `workflow.agents` (protocol +
 backends), `workflow.orchestrator` (drives the loop). **There is no
 `workflow.git` namespace** — pipeline identity is the iteration-id (S 1.2), not a
 content fingerprint.
 
-### 5.1 Agent-invocation protocol (all roles; hermes + kiro)
+#### Agent-invocation protocol (all roles; hermes + kiro)
 
 ```clojure
 (defprotocol AgentInvoker
@@ -414,7 +457,7 @@ anything. `hermes-argv` emits `chat --query-file <path> --oneshot -Q
 --max-turns <n>` (plus model/provider and isolation flags) and never emits
 `--worktree`.
 
-### 5.2 Orchestrator loop with two-phase dispatch (R-18)
+#### Orchestrator loop with two-phase dispatch (R-18)
 
 For each agent step:
 
@@ -438,7 +481,9 @@ assumed untouched (R-18). Where practical, agent effects are idempotent/
 verifiable so re-checking is safe; if reality cannot be determined, the run
 fails closed.
 
-### 5.3 Enforcement mapping (which requirement is enforced where)
+## Correctness Properties
+
+#### Enforcement mapping (which requirement is enforced where)
 
 | Req | Enforcement point |
 |-----|-------------------|
@@ -463,7 +508,66 @@ fails closed.
 
 ---
 
-### 5.4 Pipeline errors vs. process interruptions, dispatch eligibility, and authority
+The following properties must hold for every run and are checked by
+property-based and example tests (see Testing Strategy).
+
+### Property 1: Reconciliation allowance is monotonic and bounded
+
+A disagreement's reconciliation allowance never goes negative and never resets
+across recomputation, reopen, or restart. `allowance-remaining` is
+`(max 0 (- 2 attempts-used))`, and `attempts-used` only ever increases (a
+rejected proposal consumes allowance exactly like an accepted one). _Enforces R-15._
+
+**Validates: Requirements 15.1, 15.2, 15.3, 15.5**
+
+### Property 2: Every decision is binding or explicitly superseded
+
+Each persisted decision is either `:binding` or has a superseding decision
+linked by `:decision/supersedes`; both the replacement and the superseded
+decision remain queryable, and a binding decision is never mutated in place.
+_Enforces R-13, R-14, R-17._
+
+**Validates: Requirements 13.1, 14.3, 17.2**
+
+### Property 3: Derived state equals materialized state
+
+The current state derived from the highest-`:event/seq` entry of the append-only
+transition-event stream always equals the materialized `:*/state`, because the
+event append and the materialized update occur in the same ACID transaction.
+_Enforces R-17._
+
+**Validates: Requirements 17.1, 17.3, 17.4**
+
+### Property 4: Approvals bind to the exact iteration reviewed
+
+An approval is valid only while the slice's current iteration equals the
+iteration the approval named. Any authorized correction mints a new iteration,
+so a prior approval is stale by construction and cannot attach to changed work,
+including across an interruption or restart. _Enforces R-8, R-16._
+
+**Validates: Requirements 8.3, 8.4, 8.5, 16.5**
+
+### Property 5: Advancement never rests on an absent or in-doubt result
+
+No stage gate is satisfied by a missing or in-doubt outcome. `dispatch-eligible?`
+requires a recorded prerequisite fact (e.g. a recorded Correctness verdict of
+APPROVE or REQUEST_CHANGES before Structural runs), and an interrupted step is
+reconciled against observable reality before its outcome is recorded. When
+reality cannot be determined, the run fails closed. _Enforces R-1, R-7, R-18._
+
+**Validates: Requirements 1.3, 7.1, 18.2, 18.3, 18.5**
+
+## Error Handling
+
+Fail-closed is the default: illegal `[state event]` pairs, malformed events,
+missing data, silence, timeouts, and indeterminate reality all resolve to an
+error result that drives `:failed-closed` or `:escalated` rather than an
+inferred approval. The following subsection details how pipeline errors (an
+expected `REQUEST_CHANGES` verdict) differ from process interruptions (a bare
+crash with no verdict), how dispatch eligibility is decided, and where truth
+lives.
+
+#### Pipeline errors vs. process interruptions, dispatch eligibility, and authority
 
 `trace-id` is another name for `iteration-id` (S 1.1): a trace is the correlation
 key for one pass through the loop. The following four distinctions govern how the
@@ -553,28 +657,9 @@ filesystem for the latter, and writes the reconciliation back to Datalevin.
 
 ---
 
-## 6. Namespace layout
+## Testing Strategy
 
-```
-deps.edn
-src/workflow/core.clj          ; pure calculations: transition table, predicates
-src/workflow/store.clj         ; Datalevin: schema, connect, transact helpers, queries, event stream
-src/workflow/agents.clj        ; AgentInvoker protocol; HermesAgent; KiroAgent; argv calcs
-src/workflow/orchestrator.clj  ; drives the loop; perform-effect multimethod; resume/reconcile
-src/workflow/main.clj          ; entry point / CLI wiring
-test/workflow/core_test.clj
-test/workflow/store_test.clj
-test/workflow/agents_test.clj
-test/workflow/orchestrator_test.clj
-```
-
-`defmulti perform-effect` and all its `defmethod`s live in
-`workflow.orchestrator` (project rule: multimethod + all methods in one ns).
-There is no `workflow.git` namespace.
-
----
-
-## 7. Testing strategy (test-first, dogfooding the workflow)
+### Testing strategy (test-first, dogfooding the workflow)
 
 Tests are written and shown RED before implementation (R-1 discipline applied to
 this project itself):
@@ -617,7 +702,9 @@ the materialized `:*/state`.
 
 ---
 
-## 8. Dependencies (deps.edn)
+## Dependencies
+
+### Dependencies (deps.edn)
 
 - `org.clojure/clojure`
 - `datalevin/datalevin` (LMDB-backed durable Datalog).
@@ -630,9 +717,12 @@ the store tests first run.
 
 ---
 
-## 9. Open items to confirm during implementation
+## Open Items to Confirm During Implementation
+
+### Open items to confirm during implementation
 
 1. **Kiro CLI invocation** is provisional; confirm the real command/flags and
    update `kiro-argv` only (state machine untouched).
 2. **Datalevin version pin** and exact JVM `--add-opens` flags — validate on
    first `store_test` run.
+
