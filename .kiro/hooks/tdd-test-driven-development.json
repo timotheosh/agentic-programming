@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "TDD: Test Driven Development",
+      "trigger": "PreToolUse",
+      "action": {
+        "type": "agent",
+        "prompt": "# TDD Workflow\n## Philosophy\nThis project follows strict Test-Driven Development (TDD). All code must be written in response to a failing test. No production code exists without a corresponding test that drove its creation.\n## The Red-Green-Refactor Cycle\n- **Red**: Write a failing test that describes the desired behavior in plain English\n- **Green**: Write the minimum production code to make the test pass — nothing more\n- **Refactor**: Clean up the code while keeping all tests green\n## Rules\n- Never write production code before a failing test exists\n- Tests must fail for the right reason before implementing\n- Implement only what is needed to pass the current failing test\n- After each green phase, consider if refactoring is needed\n- All behavior must be described in plain English before generating a test\n## What \"Minimum\" Means\n**CRITICAL**: \"Minimum\" means the simplest possible code that makes ONLY the current test pass.\nExamples of what NOT to do:\n- ❌ Test checks \"one\" returns 1 → Don't implement a dictionary with \"one\" through \"ten\"\n- ❌ Test checks addition of two numbers → Don't implement multiplication, division, etc.\n- ❌ Test checks parsing a single word → Don't implement comma-separated parsing\nExamples of correct minimal implementations:\n- ✅ Test checks \"one\" returns 1 → Use `if numbers == \"one\": return 1`\n- ✅ Test checks \"two\" returns 2 → Add `elif numbers == \"two\": return 2`\n- ✅ After 3+ similar cases → Refactor to use a dictionary (driven by duplication, not anticipation)\n**The Golden Rule**: If you can delete code and the test still passes, you wrote too much code.\n**Resist the urge to be \"clever\" or \"complete\"**. Let the tests drive every single line of production code. Premature generalization violates TDD principles.\n## Cycle Prompt Pattern\nWhen asked to implement a feature, always:\n1. First generate a failing test for ONE specific behavior\n2. Confirm the test fails\n3. Then generate the minimal implementation (see \"What Minimum Means\" above)\n4. Confirm all tests pass\n5. Suggest refactoring opportunities (only if duplication exists)\n6. Review request and existing tests to find if additional tests are needed\n   - If at least one more test is needed, start another cycle by writing a failing test\n   - If not, declare that requirement was met\nBreak each feature into individual tasks for each step in the TDD lifecycle\n## Self-Check Before Implementing\nBefore writing production code, ask yourself:\n1. What is the EXACT assertion in the failing test?\n2. What is the SIMPLEST code that makes that assertion pass?\n3. Am I implementing anything the test doesn't verify?\n4. If I remove this line, does the test still pass? (If yes, delete it)"
+      },
+      "description": "Enforces Test-Driven Development by prompting to write failing tests before any production code. Follows the red/green/refactor cycle: write a test that fails (red), write minimal code to pass (green), then refactor.",
+      "matcher": "write",
+      "enabled": true
+    }
+  ]
+}

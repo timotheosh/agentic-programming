@@ -2,4 +2,9 @@ graft/
 *.log
 .ai/
 .claude/
+.clj-kondo/
+.cpcache/
+.lsp/
+.nrepl-port
+.workflow-db/
 probity.config.ts

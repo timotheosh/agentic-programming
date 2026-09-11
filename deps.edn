@@ -1,0 +1,35 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        datalevin/datalevin {:mvn/version "0.10.18"}}
+ :aliases
+ {:repl
+  {:main-opts ["-e" "(require 'workflow.core)"
+               "-e" "(in-ns 'workflow.core)"
+               "-r"]}
+  ;; Datalevin requires these JVM options to access internal JDK APIs.
+  :datalevin-jvm
+  {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+              "--enable-native-access=ALL-UNNAMED"]}
+
+  ;; Run the workflow entry point (workflow.main/-main). Pins the same Datalevin
+  ;; JVM flags the store needs so a real fresh run/resume can open the durable
+  ;; connection. Model defaults to "auto"; backend defaults to hermes.
+  :run
+  {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+              "--enable-native-access=ALL-UNNAMED"]
+   :main-opts ["-m" "workflow.main"]}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                io.github.cognitect-labs/test-runner
+                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   ;; Datalevin requires these JVM options to access internal JDK APIs, so the
+   ;; store tests (workflow.store round-trip / durable-resume) can open a conn.
+   :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+              "--enable-native-access=ALL-UNNAMED"]
+   :main-opts ["-m" "cognitect.test-runner"]
+   :exec-fn cognitect.test-runner.api/test}}}
