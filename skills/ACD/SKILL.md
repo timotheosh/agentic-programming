@@ -1,3 +1,7 @@
+---
+name: ACD
+description: Refactor code by classifying it into Actions, Calculations, and Data (Eric Normand's Grokking Simplicity), extracting hidden business logic into pure calculations while preserving observable behavior.
+---
 # Grokking Simplicity Refactoring Prompt — Chapters 3–9
 
 Your goal is to reduce software complexity while preserving observable behavior.
