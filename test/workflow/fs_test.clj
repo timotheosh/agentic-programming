@@ -4,11 +4,11 @@
   `observe-changes` is an ACTION: it reads the CURRENT filesystem state to learn
   what an invocation produced and classifies each produced path as :test vs.
   :production, emitting the {:path :change :class} change shape that
-  `workflow.core/capability-violation?` consumes (Property 2). These tests use a
+  `workflow.rules.core/capability-violation?` consumes (Property 2). These tests use a
   temp directory, cleaned up after. There is NO Revision computation here."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.java.io :as io]
-            [workflow.core :as core]
+            [workflow.rules.core :as core]
             [workflow.fs :as fs]))
 
 ;; --- temp-directory fixture --------------------------------------------------

@@ -3,8 +3,8 @@
         datalevin/datalevin {:mvn/version "0.10.18"}}
  :aliases
  {:repl
-  {:main-opts ["-e" "(require 'workflow.core)"
-               "-e" "(in-ns 'workflow.core)"
+  {:main-opts ["-e" "(require 'workflow.rules.core)"
+               "-e" "(in-ns 'workflow.rules.core)"
                "-r"]}
   ;; Datalevin requires these JVM options to access internal JDK APIs.
   :datalevin-jvm
@@ -12,14 +12,14 @@
               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
               "--enable-native-access=ALL-UNNAMED"]}
 
-  ;; Run the workflow entry point (workflow.main/-main). Pins the same Datalevin
+  ;; Run the workflow entry point (workflow.core/-main). Pins the same Datalevin
   ;; JVM flags the store needs so a real fresh run/resume can open the durable
   ;; connection. Model defaults to "auto"; backend defaults to hermes.
   :run
   {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
               "--enable-native-access=ALL-UNNAMED"]
-   :main-opts ["-m" "workflow.main"]}
+   :main-opts ["-m" "workflow.core"]}
 
   :test
   {:extra-paths ["test"]
