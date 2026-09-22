@@ -4,7 +4,7 @@
             [clojure.test.check.properties :as prop]
             [clojure.test.check.generators :as gen]
             [workflow.agents :as agents]
-            [workflow.core :as core]))
+            [workflow.rules.core :as core]))
 
 ;; Feature: orchestrator-state-machine, Task 6.1: the AgentInvoker protocol and
 ;; the agent-facing capability descriptors.
@@ -13,7 +13,7 @@
 ;; agents layer exposes. The concrete backends (6.3), the argv calculations
 ;; (6.2), and the fake backend (6.4) are downstream; here we only pin that the
 ;; protocol exists with the right shape and that the agent-facing descriptors
-;; reference — never contradict — workflow.core.
+;; reference — never contradict — workflow.rules.core.
 ;;
 ;; Validates: Requirements 1.4, 3.5, 11.2
 
@@ -26,7 +26,7 @@
 
 (deftest capability-descriptors-reference-core
   ;; The agent-facing descriptors must be the SAME authoritative boundary data
-  ;; that workflow.core enforces — referenced, not duplicated.
+  ;; that workflow.rules.core enforces — referenced, not duplicated.
   (is (= core/capability-descriptors agents/capability-descriptors)
       "agents/capability-descriptors must be core/capability-descriptors")
   ;; The three declared descriptor keys, with their may-write sets (R-1.4 test

@@ -8,7 +8,7 @@
     * schema round-trip — what is written under the schema survives close/reopen
       and reads back unchanged (R-17.3);
     * the append-only transition-event stream reconstructs current state via
-      `derive-current-state` (delegating to `workflow.core/current-state`), even
+      `derive-current-state` (delegating to `workflow.rules.core/current-state`), even
       after a reopen (R-17.1);
     * the materialized `:*/state` scalar equals the state DERIVED from the
       highest-`:event/seq` event — because the append and the materialized update
@@ -26,7 +26,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [datalevin.core :as d]
-            [workflow.core :as core]
+            [workflow.rules.core :as core]
             [workflow.store :as store]))
 
 ;; --- temp Datalevin directory fixture ----------------------------------------

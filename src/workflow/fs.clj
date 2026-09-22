@@ -1,7 +1,7 @@
 (ns workflow.fs
   "Filesystem actions for the multi-agent development workflow.
 
-  Unlike `workflow.core` (pure calculations), this namespace holds ACTIONS: it
+  Unlike `workflow.rules.core` (pure calculations), this namespace holds ACTIONS: it
   reads the current filesystem state. Its scope is exactly two things
   (design, Filesystem actions):
 
@@ -9,7 +9,7 @@
        changes it produced (paths created + edited) from the CURRENT filesystem
        state and classify each path as a test file or a
        production/implementation file, producing the {:path :change :class}
-       changes that `workflow.core/capability-violation?` consumes (R-1.5, R-3.6,
+       changes that `workflow.rules.core/capability-violation?` consumes (R-1.5, R-3.6,
        R-11.3).
     2. R-18 interruption-recovery reads (a separate downstream concern, task
        5.2): re-run verification and inspect produced artifacts to reconcile an
@@ -28,7 +28,7 @@
 ;;
 ;; The capability boundaries are decided over a change's :class — :test for a
 ;; test file, :production for a production/implementation file (see
-;; `workflow.core/capability-descriptors`). A path is a test file when it lives
+;; `workflow.rules.core/capability-descriptors`). A path is a test file when it lives
 ;; under a test root directory (e.g. `test/…`, `tests/…`) OR its filename marks
 ;; it as a test (a `_test`/`-test` segment, as in `foo_test.clj`, or a `.test.`/
 ;; `.spec.` infix, as in `foo.test.js`). Every other path is a
@@ -66,7 +66,7 @@
   "Classify `path` as `:test` or `:production` (design Capability descriptors).
 
   `:test` for a test file, `:production` for a production/implementation file —
-  the `:class` value `workflow.core/capability-violation?` decides boundaries
+  the `:class` value `workflow.rules.core/capability-violation?` decides boundaries
   over. Pure calculation over the path string; no filesystem access and no
   Revision derivation."
   [path]
@@ -77,7 +77,7 @@
 (defn- ->change
   "Build a produced-change map for `path` with `change` kind (`:created` or
   `:edited`), attaching the observed `:class`. Shaped exactly as
-  `workflow.core/capability-violation?` consumes: {:path :change :class}. Pure
+  `workflow.rules.core/capability-violation?` consumes: {:path :change :class}. Pure
   calculation over the path and kind."
   [path change]
   {:path   (str path)
@@ -91,6 +91,67 @@
   (.exists (if cwd
              (io/file (str cwd) (str path))
              (io/file (str path)))))
+
+;; --- Real produced-change observation: directory snapshot/diff (F2) ---------
+;;
+;; `observe-changes` (below) only CONFIRMS paths it is handed via `:created`/
+;; `:edited`; something upstream still has to DECIDE which paths those are for
+;; a real invocation (fail-closed review finding F2: a real run never populated
+;; `:changes`, so the capability boundary was never actually checked outside
+;; tests that hand-construct it). The mechanism is a directory snapshot taken
+;; immediately BEFORE an agent invocation and again immediately AFTER: any path
+;; absent before and present after is `:created`; any path present in both
+;; whose last-modified time changed is `:edited`. `snapshot-dir` is the ACTION
+;; (it reads the filesystem); `diff-snapshot` is the pure CALCULATION over two
+;; snapshot maps — no filesystem access, deterministic. Neither computes a
+;; Revision; this recovers *what the agent did to the code* for capability
+;; observation only (R-1.4/1.5, R-3.5/3.6, R-11.2/11.3), exactly like the rest
+;; of this namespace.
+
+(defn snapshot-dir
+  "ACTION: return `{relative-path last-modified-millis}` for every regular file
+  currently under `cwd` (recursively), or `{}` when `cwd` is nil or is not a
+  directory. Paths are forward-slash-relative to `cwd`, matching what
+  `observe-changes`/`classify-path` expect.
+
+  ponytail: a full recursive `file-seq` walk on every dispatch; fine at the
+  scale a single agent invocation's working directory reaches — switch to a
+  watched/indexed diff if a cwd ever grows large enough for this to matter."
+  [cwd]
+  (if (nil? cwd)
+    {}
+    (let [root (io/file (str cwd))]
+      (if (.isDirectory root)
+        (let [root-path (.getAbsolutePath root)
+              prefix-len (inc (count root-path))]
+          (into {}
+                (comp (filter (fn [^java.io.File f] (.isFile f)))
+                      (map (fn [^java.io.File f]
+                             [(-> (subs (.getAbsolutePath f) prefix-len)
+                                  (str/replace "\\" "/"))
+                              (.lastModified f)])))
+                (file-seq root)))
+        {}))))
+
+(defn diff-snapshot
+  "CALCULATION (pure): compare two `snapshot-dir` maps and classify every
+  changed path as `:created` or `:edited`.
+
+  A path absent from `before` but present in `after` is `:created`; a path
+  present in both whose last-modified value differs is `:edited`; a path
+  whose last-modified value is unchanged is not a produced change (nothing to
+  report — a re-read of an untouched file is not a write). Returns
+  `{:created […] :edited […]}`, both sorted vectors of path strings, shaped
+  for `observe-changes`'s `ctx`. Pure map comparison; no I/O."
+  [before after]
+  (let [before (or before {})
+        after  (or after {})]
+    {:created (vec (sort (keys (apply dissoc after (keys before)))))
+     :edited  (vec (sort (keep (fn [[path mtime]]
+                                  (when (and (contains? before path)
+                                             (not= mtime (get before path)))
+                                    path))
+                                after)))}))
 
 (defn observe-changes
   "ACTION: read the file changes a just-returned invocation produced and classify
@@ -109,13 +170,13 @@
   rolled-back edit is not treated as a produced change (R-18: reconciled against
   observable reality). Every confirmed path is classified via `classify-path`
   and emitted as {:path p :change :created|:edited :class :test|:production},
-  precisely the shape `workflow.core/capability-violation?` consumes. The result
+  precisely the shape `workflow.rules.core/capability-violation?` consumes. The result
   is a SET of such change maps.
 
   This reads the filesystem (it is an action) but computes NO Revision: no
   hashing, no manifest, no git, no filesystem-derived Revision value. The
   Revision counter is a Datalevin integer (R-8), never derived here. The pure
-  boundary DECISION over the returned changes lives in `workflow.core`; the
+  boundary DECISION over the returned changes lives in `workflow.rules.core`; the
   fail-closed transition a violation drives is an action in
   `workflow.orchestrator`."
   [ctx]
@@ -131,7 +192,7 @@
 ;; --- R-18 interruption-recovery reads (design R-18.3, R-18.4) ----------------
 ;;
 ;; When a Run resumes and a Step is found `:dispatched` with no recorded outcome
-;; it is `step-in-doubt?` (a pure predicate in `workflow.core`): neither assumed
+;; it is `step-in-doubt?` (a pure predicate in `workflow.rules.core`): neither assumed
 ;; complete nor assumed untouched (R-18.2). To record its ACTUAL outcome the
 ;; orchestrator reconciles it against OBSERVABLE REALITY (R-18.3) — it re-runs the
 ;; relevant verification (RED / GREEN) and inspects the artifacts the agent was
@@ -148,7 +209,7 @@
 ;;     safe and verifiable).
 ;;   * The DECISIONS `red-outcome` and `green-outcome` are pure calculations over
 ;;     the observed verification result — they map an exit code (and whether the
-;;     expected artifacts exist) to the very event keyword the `workflow.core`
+;;     expected artifacts exist) to the very event keyword the `workflow.rules.core`
 ;;     transition table consumes (`:red-verified` / `:red-invalid` / `:green`),
 ;;     or to a fail-closed `{:error …}` when reality is indeterminate (R-18.5).
 ;;
@@ -218,7 +279,7 @@
                              R-18.5) — reality cannot be determined, so the
                              orchestrator refuses to advance rather than guessing.
 
-  The returned keyword is exactly what the `workflow.core` transition table
+  The returned keyword is exactly what the `workflow.rules.core` transition table
   consumes for a `:test-design` step, so a recovered outcome feeds straight back
   into the pure state machine. This distinguishing of RED from not-RED by exit
   code does NOT judge WHY a failure occurred (syntax/fixture/etc., R-1.3); that
@@ -246,7 +307,7 @@
     * could not be run   -> `{:error {:code :indeterminate …}}` (fail closed,
                              R-18.5).
 
-  The returned keyword is a `workflow.core` transition event. Pure calculation
+  The returned keyword is a `workflow.rules.core` transition event. Pure calculation
   over the observed result; no I/O and no Revision."
   [result]
   (if (:ran? result)
@@ -254,6 +315,72 @@
     {:error {:code    :indeterminate
              :message "GREEN verification could not be re-run; reality is indeterminate."
              :cause   (:error result)}}))
+
+(defn existing-coverage-outcome
+  "DECISION (pure): recover a `:verify-existing-coverage` outcome event from an
+  observed `result` (as returned by `run-verification`), given WHICH R-16 case
+  `kind` claims.
+
+  R-16.2 and R-16.3 accept EXISTING coverage as valid evidence instead of a
+  freshly-manufactured failure, but they require opposite observable
+  realities, so `kind` selects the polarity:
+
+    * `:defect-evidence`      (R-16.2) — an existing test already demonstrates
+                                the repair's defect, so the confirming signal
+                                is that the command CURRENTLY FAILS (non-zero
+                                exit); a currently-passing result means there
+                                is no defect evidence at all.
+    * `:behavior-preserving`  (R-16.3) — a structural refactor retains its
+                                existing passing tests, so the confirming
+                                signal is that the command CURRENTLY PASSES
+                                (zero exit); a currently-failing result means
+                                the refactor broke something and owes a real
+                                RED/GREEN cycle, not this shortcut.
+
+  Returns:
+
+    * `:existing-coverage-confirmed` — the observed exit matches the polarity
+      `kind` requires;
+    * `{:error {:code :existing-coverage-not-confirmed …}}` — the observed
+      exit does NOT match (fail closed rather than assuming pre-existing
+      evidence);
+    * `{:error {:code :existing-coverage-kind-required …}}` — `kind` is
+      neither `:defect-evidence` nor `:behavior-preserving` (fail closed
+      rather than guessing which polarity applies);
+    * `{:error {:code :indeterminate …}}` — the command could not be run
+      (R-18.5).
+
+  Pure calculation over the observed result and the caller-supplied `kind`;
+  no I/O and no Revision."
+  [result kind]
+  (cond
+    (not (:ran? result))
+    {:error {:code    :indeterminate
+             :message "Existing-coverage verification could not be run; reality is indeterminate."
+             :cause   (:error result)}}
+
+    (not (#{:defect-evidence :behavior-preserving} kind))
+    {:error {:code    :existing-coverage-kind-required
+             :message (str "Existing-coverage verification requires a :kind of "
+                            ":defect-evidence (R-16.2) or :behavior-preserving (R-16.3) "
+                            "to know which polarity confirms it; none/an unrecognized kind "
+                            "was supplied.")}}
+
+    (= kind :defect-evidence)
+    (if (zero? (:exit result))
+      {:error {:code    :existing-coverage-not-confirmed
+               :message (str "The command currently passes, so there is no existing failing "
+                              "test demonstrating the defect (R-16.2) — failing closed rather "
+                              "than assuming pre-existing evidence.")}}
+      :existing-coverage-confirmed)
+
+    :else ;; :behavior-preserving
+    (if (zero? (:exit result))
+      :existing-coverage-confirmed
+      {:error {:code    :existing-coverage-not-confirmed
+               :message (str "The command currently fails, so the refactor's existing passing "
+                              "tests are not retained (R-16.3) — a real RED/GREEN cycle is owed "
+                              "rather than assuming pre-existing evidence.")}})))
 
 (defn recover-step-outcome
   "ACTION: recover an in-doubt Step's actual outcome by reconciling it against
@@ -278,7 +405,7 @@
       disk, so its outcome is not confirmable — fail closed rather than assume it
       landed, R-18.2/R-18.5);
     * otherwise the pure `red-outcome`/`green-outcome` event keyword the
-      `workflow.core` transition table consumes.
+      `workflow.rules.core` transition table consumes.
 
   This recovers *what the agent did to the code*; it records NO outcome itself
   (the orchestrator transacts the recovered outcome as Datalevin facts) and

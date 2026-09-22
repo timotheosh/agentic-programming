@@ -5,7 +5,7 @@
   (data), and the connect/close helpers that open and close an LMDB-backed,
   ACID Datalog connection. Reading and writing Datalevin is I/O, so everything
   here is an action in the Action/Calculation/Data sense — the decisions that
-  consume the maps stored here live as pure calculations in `workflow.core`.
+  consume the maps stored here live as pure calculations in `workflow.rules.core`.
 
   Durable state is the third source of truth alongside the filesystem and the
   Orchestrator's state machine; git is NOT a source of truth and Revision
@@ -17,7 +17,7 @@
   entity queries are separate downstream tasks (4.3, 4.4) that build on the
   event-append primitive below."
   (:require [datalevin.core :as d]
-            [workflow.core :as wc]))
+            [workflow.rules.core :as wc]))
 
 ;; --- The Datalevin schema as data (design Data Models; R-17, R-8, R-15, R-18) -
 ;;
@@ -25,7 +25,7 @@
 ;; fact is its own entity, so history is append-friendly and superseded decisions
 ;; are retained rather than overwritten. State-machine progress is stored as an
 ;; append-only stream of immutable transition events (`:event/*`); current state
-;; is DERIVED from the highest-:event/seq event (see `workflow.core/current-state`),
+;; is DERIVED from the highest-:event/seq event (see `workflow.rules.core/current-state`),
 ;; not mutated in place. The scalar `:*/state` attributes are a materialized
 ;; convenience kept in sync by the same transaction that appends the event.
 
@@ -40,7 +40,7 @@
   {;; --- append-only transition history: current state is derived (R-17.1) ---
    ;; One entity per state transition that ever occurs. Current state =
    ;; the :event/to-state of the highest :event/seq for the target (a run or a
-   ;; slice), consumed by workflow.core/current-state. Nothing overwrites history.
+   ;; slice), consumed by workflow.rules.core/current-state. Nothing overwrites history.
    :event/id          {:db/valueType :db.type/uuid  :db/unique :db.unique/identity}
    :event/run         {:db/valueType :db.type/ref}
    :event/slice       {:db/valueType :db.type/ref}       ; nil for run-level events
@@ -194,17 +194,17 @@
 ;;
 ;;   * A transition event is appended AND the target's materialized `:*/state`
 ;;     is updated in the SAME transaction, so the state derived from the
-;;     append-only stream (workflow.core/current-state) can never diverge from
+;;     append-only stream (workflow.rules.core/current-state) can never diverge from
 ;;     the materialized `:*/state` (R-17.1, R-17.4).
 ;;   * Recording an implementer/test-designer Step outcome AND advancing the
-;;     Iteration's `:iteration/revision` counter (via workflow.core/advance-revision)
+;;     Iteration's `:iteration/revision` counter (via workflow.rules.core/advance-revision)
 ;;     happen in the SAME transaction, so the Revision counter can never lag
 ;;     behind a recorded Step outcome — even if a crash follows immediately
 ;;     (R-8.4, R-17.4).
 ;;
 ;; These are actions: each reads the current db value and issues a single
 ;; `d/transact!`. The pure decisions they lean on (the monotonic increment) live
-;; as calculations in workflow.core; the tx-data assembly below is the action
+;; as calculations in workflow.rules.core; the tx-data assembly below is the action
 ;; that commits them. `append-transition-event` is the reusable event-append +
 ;; materialization primitive the event-stream helpers (task 4.3) build on.
 
@@ -232,7 +232,7 @@
     * updates the target's materialized `:*/state` to the event's `:to-state`.
 
   Because the append and the materialized update share the transaction, the state
-  derived from the highest-`:event/seq` event (workflow.core/current-state) always
+  derived from the highest-`:event/seq` event (workflow.rules.core/current-state) always
   equals the materialized `:*/state`; the derived state can never diverge from
   history (R-17.1, R-17.4).
 
@@ -274,7 +274,7 @@
   `:step/id` entity with its terminal `:step/status` (`:complete` | `:failed`),
   `:step/outcome-at`, and `:step/result-ref`, AND — for an `implementer` or
   `test-designer` Step — advances the owning Iteration's `:iteration/revision`
-  counter via `workflow.core/advance-revision`.
+  counter via `workflow.rules.core/advance-revision`.
 
   Recording the outcome and advancing the counter share the transaction, so the
   Revision counter can never lag behind a recorded Step outcome even if a crash
@@ -313,7 +313,7 @@
 ;; transition events; current state is DERIVED from the latest event, not mutated
 ;; in place (design, Data Models). These are the READ side of that stream: they
 ;; query events back out of Datalevin in `:event/seq` order and hand the queried
-;; event maps to the pure `workflow.core/current-state` so the derived state can
+;; event maps to the pure `workflow.rules.core/current-state` so the derived state can
 ;; be rebuilt/verified against the materialized `:*/state`.
 ;;
 ;; They do NOT append — appending (and keeping the materialized `:*/state` in
@@ -330,7 +330,7 @@
   ordering key `:event/seq`, the derivation inputs (`:event/from-state`,
   `:event/to-state`), the trigger, the timestamp, and the target refs
   (`:event/run`, `:event/slice`, `:event/iteration`) reduced to their entity ids.
-  These are exactly the keys `workflow.core/current-state` consumes to derive the
+  These are exactly the keys `workflow.rules.core/current-state` consumes to derive the
   current state of a run or slice from the stream."
   [:event/id :event/seq :event/from-state :event/to-state :event/trigger :event/at
    {:event/run [:db/id]} {:event/slice [:db/id]} {:event/iteration [:db/id]}])
@@ -339,7 +339,7 @@
   "Reduce an event's pulled ref maps to plain entity ids (calculation).
 
   `d/pull` returns `:event/run`/`:event/slice`/`:event/iteration` as `{:db/id n}`
-  maps; `workflow.core/current-state` compares those target refs by entity id.
+  maps; `workflow.rules.core/current-state` compares those target refs by entity id.
   This flattens each present ref to its `:db/id` so the queried event maps carry
   the same shape the core derivation filters on. Pure map transform; the query
   that produced the event is the action."
@@ -358,7 +358,7 @@
   returns them as plain maps sorted ascending by the monotonic `:event/seq` —
   the total order the append primitive allocated (R-17.1). Each event's target
   refs (`:event/run`, `:event/slice`, `:event/iteration`) are flattened to entity
-  ids so the maps feed straight into `workflow.core/current-state`.
+  ids so the maps feed straight into `workflow.rules.core/current-state`.
 
   With `slice-eid` supplied, the stream is sliced to just that slice's events
   (`:event/slice` = `slice-eid`) — the run-level slice for deriving a single
@@ -388,7 +388,7 @@
   "Derive `target`'s current state from the queried event stream (R-17.1).
 
   Reads the run's transition-event stream (`event-stream`) and hands it to the
-  pure `workflow.core/current-state`, which returns the `:event/to-state` of the
+  pure `workflow.rules.core/current-state`, which returns the `:event/to-state` of the
   highest-`:event/seq` event belonging to `target`. `target-attr` selects the
   target ref: `:event/run` derives the run's state, `:event/slice` (the default)
   derives a slice's state; `target` is the corresponding entity id.
@@ -410,11 +410,11 @@
 ;; The READ side of the durable store's non-event facts. Where the event-stream
 ;; queries above rebuild state from the append-only transition stream, these read
 ;; back the recorded reviews / approvals / findings / decisions / proposals /
-;; disagreements so the pure decisions in `workflow.core` can consume them:
+;; disagreements so the pure decisions in `workflow.rules.core` can consume them:
 ;;
 ;;   * `current-revision` reads the Iteration's monotonic `:iteration/revision`
 ;;     so the Orchestrator can compare an approval's bound counter value against
-;;     it via `workflow.core/approval-valid?` — approval staleness is a pure
+;;     it via `workflow.rules.core/approval-valid?` — approval staleness is a pure
 ;;     integer comparison, never an iteration-identity or file-derived check
 ;;     (R-8.5, R-8.3).
 ;;   * `find-disagreement` locates an existing `:disagreement/id` by scanning the
@@ -428,14 +428,14 @@
 ;;     (R-13.3, R-17.2).
 ;;
 ;; These are actions: each reads the current db value via `d/q`/`d/pull`. The
-;; staleness/binding decisions they feed are pure calculations in `workflow.core`.
+;; staleness/binding decisions they feed are pure calculations in `workflow.rules.core`.
 
 (defn current-revision
   "Read the Iteration `iteration-eid`'s current Revision counter (action; R-8.5).
 
   Returns the monotonic per-Iteration `:iteration/revision` counter value in
   force, or nil when the Iteration has none recorded. The Orchestrator reads this
-  on resume and hands it to the pure `workflow.core/approval-valid?` so an
+  on resume and hands it to the pure `workflow.rules.core/approval-valid?` so an
   approval is honored only while its bound `:approval/revision-counter` still
   equals this value; once an implementer/test-designer Step outcome advanced the
   counter, the approval is stale by a pure integer comparison (R-8.3, R-8.4). The
@@ -449,7 +449,7 @@
 
   Projects the fields the Orchestrator needs to decide staleness: the bound
   counter value `:approval/revision-counter` (compared against `current-revision`
-  via `workflow.core/approval-valid?`), the reviewer, the verdict, the recorded
+  via `workflow.rules.core/approval-valid?`), the reviewer, the verdict, the recorded
   staleness marker/reason, the timestamp, and the owning `:approval/review`
   reduced to its entity id."
   [:approval/id :approval/reviewer :approval/revision-counter :approval/verdict
@@ -462,7 +462,7 @@
   Queries every `:approval` whose owning `:approval/review` ran under
   `iteration-eid` (`:review/iteration`) and returns them as plain maps carrying
   their bound `:approval/revision-counter`. The Orchestrator compares each bound
-  value against `current-revision` via `workflow.core/approval-valid?` to decide
+  value against `current-revision` via `workflow.rules.core/approval-valid?` to decide
   whether the approval still holds (R-8.5). Returns an empty vector when the
   Iteration has no approvals. This is an action: it reads the current db value of
   `conn`."

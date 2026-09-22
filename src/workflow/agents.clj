@@ -12,12 +12,12 @@
 
   The capability boundary itself — which produced-change classes a role MAY write
   and the fail-closed violation decision over observed changes — lives entirely
-  in `workflow.core` (`capability-descriptors`, `role->capability`,
+  in `workflow.rules.core` (`capability-descriptors`, `role->capability`,
   `capability-for`, `capability-violation?`). This namespace does NOT re-declare
   those boundary sets or duplicate that logic; the agent-facing descriptor vars
-  below reference `workflow.core/capability-descriptors` so the two can never
+  below reference `workflow.rules.core/capability-descriptors` so the two can never
   drift."
-  (:require [workflow.core :as core]
+  (:require [workflow.rules.core :as core]
             [clojure.java.shell :as shell]
             [clojure.java.io :as io]))
 
@@ -28,7 +28,7 @@
 ;; to agentic `auto`. The task carries :role and :capability so a backend can add
 ;; role-appropriate flags and the tightest available write sandbox — but the
 ;; sandbox is advisory: capability enforcement is verified AFTER the fact by the
-;; orchestrator via `workflow.core/capability-violation?`, never trusted here.
+;; orchestrator via `workflow.rules.core/capability-violation?`, never trusted here.
 ;;
 ;; Agents do NOT inspect workflow state: eligibility, ordering, identity, and
 ;; capability enforcement are the orchestrator's responsibility. An adapter may
@@ -71,7 +71,7 @@
 ;; --- Agent-facing capability descriptors (design, Capability descriptors) ----
 ;;
 ;; The authoritative may-write / may-not-write boundary data lives in
-;; `workflow.core/capability-descriptors` (a map from descriptor keyword to the
+;; `workflow.rules.core/capability-descriptors` (a map from descriptor keyword to the
 ;; set of produced-change classes a role MAY write). The agents layer needs to
 ;; NAME those descriptors when stamping :step/capability and building a task, so
 ;; the vars below reference core's data — not a second copy. Referencing core
@@ -80,9 +80,9 @@
 
 (def capability-descriptors
   "The authoritative capability-descriptor data, re-exported from
-  `workflow.core` for the agents layer (design, Capability descriptors table).
+  `workflow.rules.core` for the agents layer (design, Capability descriptors table).
 
-  This is the SAME map as `workflow.core/capability-descriptors` — a mapping from
+  This is the SAME map as `workflow.rules.core/capability-descriptors` — a mapping from
   descriptor keyword to the set of produced-change classes a role MAY write
   (`:test-authoring` -> #{:test}, `:production-authoring` -> #{:production},
   `:read-only` -> #{}). It is referenced, not duplicated, so the boundary the
@@ -93,7 +93,7 @@
 (def capability-keys
   "The capability-descriptor keywords a task's `:capability` may name.
 
-  Derived from the authoritative `workflow.core/capability-descriptors` so the
+  Derived from the authoritative `workflow.rules.core/capability-descriptors` so the
   set of legal descriptor keys cannot drift from the boundary data: the
   test-designer's `:test-authoring`, the implementer's `:production-authoring`,
   and each reviewer's `:read-only`."
@@ -103,7 +103,7 @@
   "Return the capability descriptor keyword for `role` (design, Capability
   descriptors table).
 
-  A thin pass-through to `workflow.core/capability-for` so the agents layer can
+  A thin pass-through to `workflow.rules.core/capability-for` so the agents layer can
   stamp `:step/capability` / build a task's `:capability` without duplicating the
   role -> descriptor mapping: :test-designer -> :test-authoring,
   :implementer -> :production-authoring, and :correctness-reviewer /

@@ -1,453 +1,537 @@
 (ns workflow.core
-  "Pure calculations for the multi-agent development workflow state machine.
+  "Entry point / CLI wiring for the multi-agent development workflow state
+  machine (design, Namespace layout: `src/workflow/core.clj — entry point / CLI
+  wiring`).
 
-  This namespace holds only calculations (in the Action/Calculation/Data sense):
-  deterministic functions of their explicit inputs with no I/O and no mutation.
-  The state machine's knowledge lives in the `transitions` data table; the
-  `transition` calculation is a pure lookup over that table and fails closed for
-  every pair the table does not name."
-  (:require [clojure.string :as str]))
+  This is the outermost ACTION edge: the place a human actually starts (or
+  resumes) a Run. It integrates every prior component into one coherent driver,
+  with **no orphaned code** — the pieces below are all reachable from `-main`:
 
-;; --- The transition table as data (design R-4; no :repair state) ------------
+    * `workflow.rules.core`   — the pure `transition` table, driven indirectly
+                                through `orchestrator/drive`.
+    * `workflow.store`        — the durable Datalevin store: opened here
+                                (`store/connect`), always closed here
+                                (`store/close`), and read/written through the
+                                orchestrator's helpers and the small bootstrap
+                                transaction below (R-17.3: state is durable as it
+                                happens so a halted Run resumes).
+    * `workflow.fs`           — filesystem observation and R-18 recovery reads,
+                                reached through the orchestrator's effects and
+                                resume path.
+    * `workflow.agents`       — the `AgentInvoker` backend this entry point
+                                selects and constructs: **hermes** by default
+                                (`agents/hermes-agent`, confirmed) and **kiro**
+                                provisionally (`agents/kiro-agent`), with the
+                                model defaulting to agentic `\"auto\"` (R-4.1).
+                                A deterministic `agents/fake-agent` backend is
+                                selectable so the whole wiring can be driven
+                                without a real agent binary (R-4.2).
+    * `workflow.orchestrator` — the loop owner: `orchestrator/drive`,
+                                `orchestrator/dispatch-step!`,
+                                `orchestrator/run-review-round!`,
+                                `orchestrator/resume-iteration!`, and the
+                                escalation path. This namespace never re-decides
+                                anything `orchestrator`/`rules.core` already own;
+                                it only parses configuration, opens the store,
+                                builds the invoker, and hands control to the
+                                orchestrator.
+
+  ACD separation (R-4.1): parsing the run configuration is a pure **calculation**
+  (`parse-args` / `run-config`); opening the store, constructing the backend,
+  bootstrapping a fresh Run, and driving the loop are thin **actions** at the
+  edge. No business rule (transition legality, capability boundaries, Revision
+  identity) is duplicated here — those live in `workflow.rules.core` and are
+  reached only through the orchestrator.
+
+  Invocation (a `:run` alias is added to `deps.edn`, pinning the Datalevin JVM
+  flags the store needs):
+
+      clojure -M:run --db-dir /path/to/db --backend hermes --model auto \\
+              --requirements \"…\" --prompt \"…\"      ; fresh run
+      clojure -M:run --db-dir /path/to/db --resume --run-id <uuid>   ; resume
+
+  See `usage` for the full option list."
+  (:require [clojure.string :as str]
+            [datalevin.core :as d]
+            [workflow.agents :as agents]
+            [workflow.orchestrator :as orch]
+            [workflow.orchestrator.resume :as resume]
+            [workflow.store :as store])
+  (:gen-class))
+
+;; --- run configuration: a PURE calculation over argv (ACD; R-4.1) ------------
 ;;
-;; transition :: state -> event -> Result
-;;   Result = {:next-state s}                 ; advance
-;;          | {:next-state s :effects [...]}  ; advance + described effects
-;;          | {:error {:code ...}}            ; fail-closed
+;; `parse-args` turns a raw argv vector into a config map WITHOUT touching the
+;; world — no store is opened, no backend is built, nothing is spawned. Keeping
+;; the parse pure means the CLI surface is unit-testable by passing a vector of
+;; strings and inspecting the returned map; the actions below (`open-store!`,
+;; `make-invoker`, `bootstrap-run!`, `execute-run!`) consume that data.
+
+(def default-db-dir
+  "Default Datalevin database directory when `--db-dir` is not supplied. One
+  database directory per installation (design, Datalevin schema: \"path
+  configurable\")."
+  ".workflow-db")
+
+(def backends
+  "The selectable `AgentInvoker` backends, keyed by the `--backend` value. The
+  default is `:hermes` (confirmed); `:kiro` is provisional (design: hermes first,
+  then kiro); `:fake` is the deterministic in-memory backend used to drive the
+  wiring without a real agent binary (R-4.2)."
+  #{:hermes :kiro :fake})
+
+(def default-model
+  "The default model selection when `--model` is not supplied: agentic `\"auto\"`
+  (design; requirements: model `auto` when none is chosen; R-4.1). Matches the
+  default the agent backends apply per task, kept here so the CLI surfaces the
+  same default explicitly on the parsed config."
+  "auto")
+
+(defn- parse-flag-pairs
+  "Fold a `--flag value` / boolean-`--flag` argv into a raw string-keyed map.
+
+  Pure helper for `parse-args`: a token beginning with `--` starts an option; the
+  NEXT token is its value unless it is itself a `--flag` or absent, in which case
+  the flag is a boolean `true` (e.g. `--resume`). Unrecognized/positional tokens
+  are collected under `:_args`. No I/O."
+  [args]
+  (loop [tokens (seq args)
+         acc    {:_args []}]
+    (if-let [tok (first tokens)]
+      (if (str/starts-with? tok "--")
+        (let [k    (subs tok 2)
+              nxt  (second tokens)]
+          (if (and nxt (not (str/starts-with? nxt "--")))
+            (recur (nnext tokens) (assoc acc k nxt))
+            (recur (next tokens) (assoc acc k true))))
+        (recur (next tokens) (update acc :_args conj tok)))
+      acc)))
+
+(defn parse-args
+  "Parse a raw CLI argv vector into a run-configuration map (PURE calculation;
+  R-4.1).
+
+  Recognized options:
+    --db-dir <path>        Datalevin database directory (default `default-db-dir`)
+    --backend <name>       agent backend: hermes (default) | kiro | fake
+    --model <name>         model selection (default \"auto\", agentic auto; R-4.1)
+    --requirements <text>  the run's requirements, as a literal inline string
+                            (fresh run)
+    --requirements-file <path>  the run's requirements, read from a file (fresh
+                            run); takes precedence over --requirements when both
+                            are given (F3: a requirements DOCUMENT does not fit
+                            on a command line — this is a raw path only, parsed
+                            here without touching the filesystem; the ACTION
+                            that reads it is `resolve-requirements`, called by
+                            `fresh-run!`, so `parse-args` itself stays pure)
+    --prompt <text>        the initial scoped-work prompt (fresh run)
+    --cwd <path>           working directory agents/verifications run in
+    --resume               resume an interrupted run instead of starting fresh
+    --run-id <uuid>        the run to resume (with --resume)
+    --help                 show usage and exit
+
+  Returns a config map:
+    {:db-dir       <string>
+     :backend      <:hermes|:kiro|:fake>
+     :model        <string>            ; \"auto\" default
+     :mode         <:fresh|:resume>
+     :requirements <string|nil>
+     :requirements-file <string|nil>   ; a raw path, not yet read (F3)
+     :prompt       <string|nil>
+     :cwd          <string|nil>
+     :run-id       <string|nil>        ; supplied with --resume
+     :help?        <boolean>
+     :errors       [<string> …]}       ; non-empty => invalid config, do not run
+
+  Validation is pure and fail-closed: an unknown `--backend` and a `--resume`
+  without `--run-id` are reported in `:errors` rather than guessed, so `-main`
+  can refuse to open the store on a malformed configuration. No I/O."
+  [args]
+  (let [raw     (parse-flag-pairs args)
+        help?   (boolean (get raw "help"))
+        resume? (boolean (get raw "resume"))
+        backend (keyword (get raw "backend" "hermes"))
+        model   (let [m (get raw "model")]
+                  (if (string? m) m default-model))
+        run-id  (let [r (get raw "run-id")] (when (string? r) r))
+        base    {:db-dir       (let [d (get raw "db-dir")]
+                                 (if (string? d) d default-db-dir))
+                 :backend      backend
+                 :model        model
+                 :mode         (if resume? :resume :fresh)
+                 :requirements (let [x (get raw "requirements")] (when (string? x) x))
+                 :requirements-file (let [x (get raw "requirements-file")] (when (string? x) x))
+                 :prompt       (let [x (get raw "prompt")] (when (string? x) x))
+                 :cwd          (let [x (get raw "cwd")] (when (string? x) x))
+                 :run-id       run-id
+                 :help?        help?}
+        errors  (cond-> []
+                  (not (contains? backends backend))
+                  (conj (str "Unknown --backend " (name backend)
+                             "; expected one of " (str/join ", " (map name (sort backends))) "."))
+                  (and resume? (not run-id))
+                  (conj "--resume requires --run-id <uuid> naming the run to resume."))]
+    (assoc base :errors errors)))
+
+(defn run-config
+  "Alias for `parse-args`: build the run-configuration map from argv (PURE; R-4.1).
+
+  Provided under the name the task/design use for the config-parse fn; delegates
+  to `parse-args` so there is exactly one parser."
+  [args]
+  (parse-args args))
+
+(def usage
+  "Human-readable CLI usage string, printed on --help or an invalid configuration."
+  (str/join
+   \newline
+   ["workflow.core — multi-agent development workflow state machine"
+    ""
+    "Usage:"
+    "  clojure -M:run --db-dir <path> --backend hermes --model auto \\"
+    "          --requirements \"…\" --prompt \"…\"        start a fresh run"
+    "  clojure -M:run --db-dir <path> --resume --run-id <uuid>   resume a run"
+    ""
+    "Options:"
+    "  --db-dir <path>        Datalevin database directory (default .workflow-db)"
+    "  --backend <name>       hermes (default) | kiro (provisional) | fake"
+    "  --model <name>         model selection (default \"auto\")"
+    "  --requirements <text>  the run's requirements, as an inline string (fresh run)"
+    "  --requirements-file <path>  the run's requirements, read from a file (fresh"
+    "                          run); takes precedence over --requirements"
+    "  --prompt <text>        the initial scoped-work prompt (fresh run)"
+    "  --cwd <path>           working directory agents/verifications run in"
+    "  --resume               resume an interrupted run instead of starting fresh"
+    "  --run-id <uuid>        the run to resume (with --resume)"
+    "  --help                 show this help"]))
+
+;; --- edge actions: build the backend, open the store, bootstrap, drive -------
 ;;
-;; RED and GREEN verification are effects, not states, so there are no
-;; :red-verify / :green-verify states here. A REQUEST_CHANGES is reconciled into
-;; an accepted correction plan that mints a NEW iteration at :test-design via the
-;; :begin-iteration effect, so there is no :repair state either.
+;; Each fn below is a thin action. `make-invoker` is the one place the CLI
+;; SELECTS a backend (hermes default, kiro provisional, fake for driving the
+;; wiring) — the orchestrator only ever sees an `AgentInvoker`, never a concrete
+;; record (R-4.2). `open-store!`/`close-store!` bracket the durable store so it
+;; is ALWAYS closed. `bootstrap-run!` mints the initial run/slice/iteration and
+;; the very first transition into `:test-design`, matching how the design's
+;; lifecycle starts a fresh pass at the test-designer.
 
-(def transitions
-  "Pure data: the legal [state event] -> Result pairs of the workflow."
-  {;; test-design: RED verification gates entry to implementation (R-1).
-   [:test-design :red-verified]                 {:next-state :implement}
-   ;; Behavior-preserving structural correction: existing coverage already
-   ;; demonstrates the behavior, so RED is not manufactured (R-16.3).
-   [:test-design :existing-coverage-confirmed]  {:next-state :implement}
-   ;; Invalid RED retries at test-design (R-1.3).
-   [:test-design :red-invalid]                  {:next-state :test-design}
-   ;; The test-designer may not write production code (R-1.5).
-   [:test-design :production-touched]           {:error {:code :test-designer-wrote-production}}
+(defn make-invoker
+  "Construct the selected `AgentInvoker` backend from `config` (ACTION; R-4.2).
 
-   ;; implement: GREEN advances to review; the implementer may not touch tests.
-   [:implement :green]                          {:next-state :review-correctness}
-   [:implement :test-touched]                   {:error {:code :implementer-wrote-test}}
-   ;; A reported test conflict routes back to the test-designer on the CURRENT
-   ;; iteration (no new trace-id, no :begin-iteration) (R-3.3, R-3.4).
-   [:implement :test-conflict]                  {:next-state :test-design
-                                                 :effects [{:effect/type :route-conflict-to-test-designer}]}
+  `:hermes` (default) builds the CONFIRMED `agents/hermes-agent`; `:kiro` builds
+  the PROVISIONAL `agents/kiro-agent` (design: hermes first, then kiro, model
+  defaulting to \"auto\"); `:fake` builds a deterministic `agents/fake-agent` that
+  spawns nothing, so a human — or the verification below — can drive the whole
+  wiring without a real agent binary on PATH (R-4.2). The optional
+  `:fake-results` / `:fake-result-fn` in `config` script the fake backend.
 
-   ;; review-correctness always runs first; either verdict proceeds to
-   ;; structural review (R-7). A reviewer may not edit any file (R-11.3).
-   [:review-correctness :approve]               {:next-state :review-structural}
-   [:review-correctness :request-changes]       {:next-state :review-structural}
-   [:review-correctness :reviewer-edited]       {:error {:code :reviewer-attempted-repair}}
+  The orchestrator holds only the returned `AgentInvoker`; the model default
+  \"auto\" travels on the per-step task, not on the backend record."
+  [{:keys [backend fake-results fake-result-fn]}]
+  (case backend
+    :hermes (agents/hermes-agent)
+    :kiro   (agents/kiro-agent)
+    :fake   (agents/fake-agent (cond-> {}
+                                 fake-results   (assoc :results fake-results)
+                                 fake-result-fn (assoc :result-fn fake-result-fn)))
+    ;; Fail closed on an unrecognized backend rather than defaulting silently:
+    ;; `parse-args` already reports this in :errors, but a direct caller is
+    ;; refused here too.
+    (throw (ex-info "Unknown agent backend" {:backend backend :expected backends}))))
 
-   ;; review-structural: the AND-gate. Both approve => slice approved; any
-   ;; request-changes => reconcile. A reviewer may not edit any file (R-11.3).
-   [:review-structural :both-approve]           {:next-state :slice-approved}
-   [:review-structural :any-request-changes]    {:next-state :reconcile}
-   [:review-structural :reviewer-edited]        {:error {:code :reviewer-attempted-repair}}
+(defn open-store!
+  "Open the durable Datalevin store at `config`'s `:db-dir` (ACTION; R-17.3).
 
-   ;; reconcile: an accepted correction plan mints a NEW iteration that begins
-   ;; at :test-design (R-16.1); an exhausted allowance escalates (R-15.4).
-   [:reconcile :plan-accepted]                  {:next-state :test-design
-                                                 :effects [{:effect/type :begin-iteration}]}
-   [:reconcile :allowance-exhausted]            {:next-state :escalated}})
+  Thin wrapper over `store/connect` so the entry point has one obvious place the
+  store is opened. The caller MUST pair this with `close-store!` (or the
+  `execute-run!` wrapper below) so LMDB resources are released; state written through the
+  orchestrator is durable as each fact happens (R-17.3), so a halted Run resumes."
+  [{:keys [db-dir]}]
+  (store/connect db-dir))
 
-(defn transition
-  "Pure lookup of the Result for `state` on `event`.
+(defn close-store!
+  "Close the durable store opened by `open-store!` (ACTION), releasing LMDB
+  resources. After close the connection must not be reused."
+  [conn]
+  (store/close conn))
 
-  Returns the table's Result for a legal pair. Illegal [state event] pairs,
-  malformed events, and missing data all resolve to {:error ...} (fail closed) —
-  approval is never inferred from silence, timeout, tool failure, or malformed
-  output. Performs no I/O."
-  [state event]
-  (or (get transitions [state event])
-      {:error {:code :illegal-transition
-               :message "No legal transition for the given [state event] pair."
-               :state state
-               :event event}}))
+(defn bootstrap-run!
+  "Mint a fresh Run — run/slice/iteration entities and the first transition into
+  `:test-design` — and return their entity ids (ACTION; R-17.3, R-17.4).
 
-;; --- Revision-counter calculations (design R-8; Property 6) -----------------
+  A fresh Run starts a pass at the `test-designer` (design, State machine:
+  `:test-design` is the start of EVERY iteration). This commits, durably:
+
+    1. one `d/transact!` minting the `:run` (at `:planning`, carrying the verbatim
+       `:run/requirements`), its first `:slice` (order 0), and the slice's first
+       `:iteration` (number 0, `:iteration/revision` 0, set as
+       `:slice/current-iteration`);
+    2. the initial transition event `:planning -> :test-design` on that trace via
+       `store/append-transition-event`, which materializes the slice's
+       `:slice/state` in the same ACID commit (R-17.4).
+
+  `config` supplies the verbatim `:requirements`. Returns
+    {:run-eid <eid> :run-id <uuid> :slice-eid <eid> :iteration-eid <eid>
+     :iteration-id <uuid> :state :test-design}
+  — the ids the orchestrator's `ctx` needs and the state `drive` begins from. This
+  is an action: it commits durable state on disk."
+  [conn {:keys [requirements]}]
+  (let [run-id   (random-uuid)
+        slice-id (random-uuid)
+        iter-id  (random-uuid)
+        report   (d/transact!
+                  conn
+                  [(cond-> {:db/id -1 :run/id run-id :run/state :planning
+                            :run/created-at (java.util.Date.)}
+                     requirements (assoc :run/requirements requirements))
+                   {:db/id -2 :slice/id slice-id :slice/run -1
+                    :slice/order 0 :slice/state :planning
+                    :slice/current-iteration -3}
+                   {:db/id -3 :iteration/id iter-id :iteration/slice -2
+                    :iteration/number 0 :iteration/revision 0
+                    :iteration/started-at (java.util.Date.)}])
+        tempids  (:tempids report)
+        run-eid   (get tempids -1)
+        slice-eid (get tempids -2)
+        iter-eid  (get tempids -3)]
+    ;; The first transition enters :test-design on the fresh trace (R-16.1).
+    (store/append-transition-event
+     conn
+     {:run-eid       run-eid
+      :slice-eid     slice-eid
+      :iteration-eid iter-eid
+      :from-state    :planning
+      :to-state      :test-design
+      :trigger       :run-started})
+    {:run-eid       run-eid
+     :run-id        run-id
+     :slice-eid     slice-eid
+     :iteration-eid iter-eid
+     :iteration-id  iter-id
+     :state         :test-design}))
+
+;; --- run lifecycle: fresh run vs. resume, driving the orchestrator loop ------
 ;;
-;; A Revision is the identity an approval binds to: a monotonically increasing
-;; integer counter scoped to the current Iteration and held in Datalevin. It
-;; carries NO file information — it is not a hash, not a manifest, not derived
-;; from or compared against the filesystem, and not git. The functions below are
-;; pure calculations over integer counter values; every filesystem/Datalevin
-;; read that supplies those values is an action living elsewhere.
+;; The orchestrator OWNS the loop; these fns only build the effect context `ctx`
+;; the orchestrator consumes and hand control to `orchestrator/drive` /
+;; `orchestrator/resume-iteration!`. The `ctx` map is exactly the effect context
+;; the orchestrator documents (conn, agent-invoker, run/slice/iteration eids,
+;; role/capability, cwd, injectable verification command). Nothing here decides a
+;; transition; `drive` calls `core/transition` for that.
 
-(defn advance-revision
-  "Advance the Revision counter by one: pure `(inc counter)` (R-8.4).
+(defn effect-context
+  "Assemble the orchestrator effect-context map `ctx` from a store connection, an
+  `AgentInvoker`, seeded entity ids, and the run `config` (calculation over the
+  supplied values; no I/O).
 
-  This is the monotonic increment applied to the Iteration's Revision counter
-  when an implementer or test-designer Step outcome is recorded. The transaction
-  that persists the incremented value is an action in `workflow.store`; the
-  increment itself is this calculation. Strictly monotonic: the result is always
-  the successor of `counter`."
-  [counter]
-  (inc counter))
+  This is the single place the entry point wires the durable store, the selected
+  backend, and the per-run inputs (`:cwd`, `:model`, `:prompt`) into the shape
+  the orchestrator's effects read (see `workflow.orchestrator` docstring). Extra
+  per-dispatch inputs (`:command`, `:changes`, `:role`, `:capability`) are added
+  by the orchestrator/caller for a specific Step."
+  [conn invoker {:keys [run-eid slice-eid iteration-eid]} {:keys [model prompt cwd backend]}]
+  (cond-> {:conn          conn
+           :agent-invoker invoker
+           :run-eid       run-eid
+           :slice-eid     slice-eid
+           :iteration-eid iteration-eid
+           :model         model
+           :backend       backend}
+    prompt (assoc :prompt prompt)
+    cwd    (assoc :cwd cwd)))
 
-(defn approval-valid?
-  "True iff `approval` still binds to the Iteration's `current-revision-counter`.
+(defn resolve-requirements
+  "ACTION: when `config` names a `:requirements-file`, read it and return
+  `config` with `:requirements` set to the file's VERBATIM contents — the
+  SAME pure `:requirements` config field `parse-args` already defines,
+  overriding any inline `--requirements` text (F3).
 
-  An approval binds to the Revision counter value in force when it was recorded
-  (`:approval/revision-counter`). It is valid only while that bound value equals
-  the Iteration's current counter; once an implementer/test-designer Step outcome
-  advances the counter, the bound value no longer matches and the approval is
-  stale, so re-approval is required (R-8.3, R-8.4, R-8.5).
+  This is the one place the requirements FILE is actually read: `parse-args`
+  stays pure (it only captures the raw path string), and this thin action does
+  the `slurp`. Requirements documents do not fit on a command line and risk
+  exceeding `ARG_MAX`; this is how a real requirements doc
+  (`.kiro/specs/.../requirements.md`-shaped) reaches a fresh Run.
 
-  This is a pure integer comparison over a counter value read from Datalevin —
-  approval validity is decided by the Revision counter value, never by iteration
-  identity and never by any file-derived value."
-  [approval current-revision-counter]
-  (= (:approval/revision-counter approval) current-revision-counter))
+  Returns `config` unchanged when no `:requirements-file` is set. On a read
+  failure (missing/unreadable file) returns `config` with an `:error` map
+  describing the failure and `:requirements` untouched — the caller (
+  `fresh-run!`) fails closed rather than starting a run with a swallowed I/O
+  error or silently falling back to whatever inline text happened to also be
+  present."
+  [{:keys [requirements-file] :as config}]
+  (if-not requirements-file
+    config
+    (try
+      (assoc config :requirements (slurp requirements-file))
+      (catch Exception e
+        (assoc config :error
+               {:code    :requirements-file-unreadable
+                :message (str "Could not read --requirements-file " requirements-file
+                              ": " (.getMessage e))
+                :path    requirements-file})))))
 
-(defn both-approved?
-  "True iff BOTH reviewers approve the SAME Revision counter value (R-16 AND-gate).
+(defn fresh-run!
+  "Start a FRESH Run and drive it through its first Iteration (ACTION; STR-1).
 
-  Holds only when both `correctness-approval` and `structural-approval` carry an
-  `:approve` verdict AND both bind to the round's `revision-counter` value
-  (R-8.1, R-8.3, R-16.4). If either verdict is not `:approve`, or either approval
-  binds to a different counter value, the AND-gate does not hold. Pure comparison
-  over recorded facts; no I/O."
-  [correctness-approval structural-approval revision-counter]
-  (and (= :approve (:approval/verdict correctness-approval))
-       (= :approve (:approval/verdict structural-approval))
-       (approval-valid? correctness-approval revision-counter)
-       (approval-valid? structural-approval revision-counter)))
+  Resolves a `:requirements-file` if named (`resolve-requirements`, F3),
+  failing closed without bootstrapping anything if the file cannot be read.
+  Otherwise bootstraps the run/slice/iteration (`bootstrap-run!`), which
+  durably commits the first transition into `:test-design` — the start of
+  EVERY iteration (design, State machine) — assembles the orchestrator effect
+  context (`ctx`), and HANDS CONTROL TO THE ORCHESTRATOR: `orch/run-iteration!`
+  composes `dispatch-step!`, `drive`, and `run-review-round!` into the real
+  test-design -> RED -> implement -> GREEN -> review round -> AND-gate pass
+  (STR-1 — this is what makes the namespace docstring's \"no orphaned code,
+  reachable from `-main`\" claim true for a fresh Run; `orchestrator/drive` was
+  previously invoked nowhere in `src/`, only in tests).
 
-;; --- Finding validity (design R-10; Property 8) -----------------------------
-;;
-;; Every requested change (finding) must be fully justified: it explains the
-;; problem, supplies supporting evidence, gives the justification, and states
-;; the required outcome (R-10.1). A finding that omits any one of those four is
-;; an invalid change request (R-10.2). This is a pure decision over the finding
-;; map; the persistence of a finding is an action living elsewhere.
+  `config` supplies `run-iteration!`'s `spec` via `:red-command`,
+  `:green-command`, `:existing-coverage-kind`, `:correctness-verdict`,
+  `:structural-verdict` (all optional; verdicts default to `:request-changes`,
+  never inferring approval, R-8.6). This entry point never re-decides
+  anything `orchestrator`/`core` already own — it only resolves config,
+  bootstraps, and hands control off.
 
-(def finding-required-fields
-  "The four R-10 fields a valid finding must present and fill (R-10.1)."
-  [:finding/problem :finding/evidence :finding/justification :finding/required-outcome])
+  Returns
+    {:mode :fresh :run-id <uuid> :ids <seeded ids> :ctx <effect context>
+     :iteration <orch/run-iteration! result>
+     :drive {:state <where the pass settled> :error <fail-closed error|nil>}}
+  or, on an unreadable requirements file, `{:mode :fresh :error {…}}` (nothing
+  bootstrapped)."
+  [conn invoker config]
+  (let [config* (resolve-requirements config)]
+    (if (:error config*)
+      {:mode :fresh :error (:error config*)}
+      (let [ids       (bootstrap-run! conn config*)
+            ctx       (effect-context conn invoker ids config*)
+            iteration (orch/run-iteration!
+                       ctx
+                       (select-keys config* [:red-command :green-command
+                                              :existing-coverage-kind
+                                              :correctness-verdict :structural-verdict]))]
+        {:mode      :fresh
+         :run-id    (:run-id ids)
+         :ids       ids
+         :ctx       ctx
+         :iteration iteration
+         :error     (:error iteration)
+         :drive     {:state (:state iteration) :error (:error iteration)}}))))
 
-(defn finding-valid?
-  "True iff `finding` is fully justified per R-10.
+(defn- run-eid-by-id
+  "Look up the run entity id for a `:run/id` UUID string (ACTION), or nil."
+  [conn run-id-str]
+  (let [uuid (parse-uuid run-id-str)]
+    (ffirst (d/q '[:find ?e :in $ ?rid :where [?e :run/id ?rid]]
+                 (d/db conn) uuid))))
 
-  Valid iff ALL FOUR R-10 fields — :finding/problem, :finding/evidence,
-  :finding/justification, and :finding/required-outcome — are present and
-  non-blank. A missing, nil, or blank (empty or whitespace-only) value in any
-  one of the four makes the finding an invalid change request (R-10.2). Pure
-  calculation over a plain map; no I/O."
-  [finding]
-  (every? (fn [field]
-            (let [v (get finding field)]
-              (and (string? v) (not (str/blank? v)))))
-          finding-required-fields))
+(defn- current-iteration-eid
+  "Read the run's first slice's current iteration entity id (ACTION), or nil.
 
-;; --- Reconciliation-allowance calculations (design R-15; Property 12) --------
-;;
-;; A Disagreement carries a bounded Reconciliation allowance: one initial
-;; proposal plus one revision, for two proposal attempts total (R-15.1). The
-;; allowance is tracked as an accepted-OR-rejected count on
-;; :disagreement/attempts-used, keyed to the Disagreement's stable
-;; :disagreement/id. The functions below are pure calculations over that count;
-;; the ACID transaction that durably records a consumption (R-15.5) and the
-;; per-:disagreement/id preservation across restart (R-15.3) are actions living
-;; in `workflow.store`.
+  A resume operates on the SAME trace (design, Resume): this locates the active
+  Iteration whose in-doubt Steps the orchestrator reconciles."
+  [conn run-eid]
+  (let [slice-eid (ffirst (d/q '[:find ?s :in $ ?r
+                                 :where [?s :slice/run ?r]]
+                               (d/db conn) run-eid))]
+    (when slice-eid
+      (:db/id (:slice/current-iteration
+               (d/pull (d/db conn) [{:slice/current-iteration [:db/id]}] slice-eid))))))
 
-(def reconciliation-allowance
-  "The explicit per-Disagreement allowance: initial proposal + one revision
-  (two proposal attempts total) (R-15.1)."
-  2)
+(defn resume-run!
+  "RESUME an interrupted Run on the SAME trace (ACTION; R-18, R-8.5).
 
-(defn allowance-remaining
-  "Remaining Reconciliation allowance for `disagreement`: `(max 0 (- 2 used))`
-  (R-15.1).
+  Locates the run (`--run-id`) and its active Iteration, then hands control to
+  `orchestrator/resume-iteration!`, which reconciles any in-doubt Step against
+  observable reality (`workflow.fs` recovery: re-run RED/GREEN, inspect
+  artifacts) before recording its outcome — failing closed if reality is
+  indeterminate — and records resume-staleness for any approval whose Revision
+  counter advanced. This entry point never restarts at `:test-design`; that is
+  reserved for a review-authorized correction, which the orchestrator mints
+  itself.
 
-  Reads the accepted-OR-rejected count from :disagreement/attempts-used (nil
-  treated as zero) and returns how many of the two allowed proposal attempts
-  remain. Clamped at zero so an exhausted or over-consumed allowance never goes
-  negative, and it never exceeds the explicit allowance of two. Pure calculation
-  over a plain map; no I/O."
-  [disagreement]
-  (max 0 (- reconciliation-allowance
-            (or (:disagreement/attempts-used disagreement) 0))))
+  `config` supplies `:run-id`; `:recovery` (optional) is the per-in-doubt-Step
+  recovery-inputs map `orchestrator/resume-iteration!` consumes. Returns
+    {:mode :resume :run-eid <eid> :iteration-eid <eid>
+     :resume <orchestrator/resume-iteration! result>}
+  or {:mode :resume :error {…}} when the run/iteration cannot be located (fail
+  closed)."
+  [conn {:keys [run-id recovery] :as _config}]
+  (if-let [run-eid (run-eid-by-id conn run-id)]
+    (if-let [iter-eid (current-iteration-eid conn run-eid)]
+      {:mode          :resume
+       :run-eid       run-eid
+       :iteration-eid iter-eid
+       :resume        (resume/resume-iteration! conn {:iteration-eid iter-eid
+                                                       :recovery (or recovery {})})}
+      {:mode  :resume
+       :error {:code :no-active-iteration
+               :message "The run has no active iteration to resume."
+               :run-id run-id}})
+    {:mode  :resume
+     :error {:code :run-not-found
+             :message "No run found for the supplied --run-id."
+             :run-id run-id}}))
 
-(defn consume-attempt
-  "Consume one Reconciliation allowance attempt: increment :attempts-used and
-  return the updated Disagreement (R-15.2).
+(defn execute-run!
+  "Drive a Run for `config`, opening and ALWAYS closing the durable store
+  (ACTION; R-4.2, R-17.3).
 
-  Increments :disagreement/attempts-used by one regardless of whether the
-  proposal was accepted or rejected — a rejected proposal consumes allowance
-  identically to an accepted one (R-15.2) — so the count only ever increases.
-  The Disagreement's stable :disagreement/id is preserved. Pure calculation over
-  a plain map; the durable per-id recording of the consumption is an action
-  living elsewhere (R-15.5)."
-  [disagreement]
-  (update disagreement :disagreement/attempts-used (fnil inc 0)))
+  The top-level orchestration action a caller (or `-main`) uses once it has a
+  valid `config`: it opens the store (`open-store!`), dispatches to `fresh-run!`
+  or `resume-run!` per `:mode`, and closes the store in a `finally` so LMDB
+  resources are released even on failure.
 
-;; --- Decision / reconsideration calculations (design R-13, R-14; Prop 10, 11) -
-;;
-;; An agreed outcome is recorded as a Decision entity: a descriptive
-;; :decision/subject, the agreed :decision/statement, and a :decision/status of
-;; :binding or :superseded. A Decision stays :binding until a replacement is
-;; accepted through reconciliation, at which point the prior Decision is flipped
-;; to :superseded (a new Decision links back via :decision/supersedes); both
-;; remain queryable (R-13.1, R-17.2). A proposed repair/outcome carries the
-;; :proposal/subject it acts on and the :proposal/body outcome it would produce.
-;; The functions below are pure decisions over those plain maps; the ACID
-;; transaction that records a decision or supersession is an action living in
-;; `workflow.store`.
+  The selected `AgentInvoker` is built ONLY for a fresh run (`make-invoker`) —
+  a resume dispatches no new agent (it reconciles in-doubt Steps against
+  observable reality), so it needs no backend and never constructs one. An
+  optional pre-built `:invoker` in `config` (or a passed `invoker`) overrides
+  `make-invoker` for a fresh run — the seam that lets a `fake-agent` and a temp
+  store drive the wiring without a real binary.
 
-(defn binding-conflict?
-  "Return the binding Decision a `proposed-outcome` would contradict, or nil.
+  Returns the `fresh-run!` / `resume-run!` result map (with the store already
+  closed)."
+  ([config] (execute-run! config nil))
+  ([config invoker]
+   (let [conn (open-store! config)]
+     (try
+       (case (:mode config)
+         :resume (resume-run! conn config)
+         (fresh-run! conn
+                     (or invoker (:invoker config) (make-invoker config))
+                     config))
+       (finally
+         (close-store! conn))))))
 
-  Scans `binding-decisions` for a Decision that (a) is still in force
-  (:decision/status = :binding — a :superseded Decision never blocks a repair,
-  R-13.1) and (b) shares the proposed outcome's :proposal/subject yet whose
-  agreed :decision/statement differs from the proposed :proposal/body. Such a
-  repair contradicts a Binding decision and must be rejected until the outcome is
-  formally replaced (R-13.2); the returned Decision names what it conflicts with.
+(defn -main
+  "CLI entry point (ACTION): parse argv, then open the store, build the backend,
+  and drive the orchestrator loop for a fresh run or a resume.
 
-  Returns nil when the proposal agrees with the binding statement on its subject,
-  addresses an unrelated subject, or only overlaps a superseded Decision — i.e.
-  no still-binding outcome is contradicted. Every subsequent repair is checked
-  against the whole set of binding decisions (R-13.3). Pure calculation over
-  plain maps; no I/O."
-  [proposed-outcome binding-decisions]
-  (let [subject (:proposal/subject proposed-outcome)
-        body    (:proposal/body proposed-outcome)]
-    (first
-     (filter (fn [d]
-               (and (= :binding (:decision/status d))
-                    (= subject (:decision/subject d))
-                    (not= body (:decision/statement d))))
-             binding-decisions))))
+  On `--help` or an invalid configuration (`parse-args` reported `:errors`) prints
+  `usage` and returns without touching the world — fail closed on a malformed
+  configuration rather than opening a store or spawning anything. Otherwise
+  delegates to `execute-run!`, which opens/closes the store and drives the orchestrator.
 
-(defn reconsideration-admissible?
-  "True iff a reconsideration `request` identifies a specific decision AND
-  supplies new evidence (R-14.1, R-14.2).
+  Keeps I/O at the edge: the parse is pure, and this fn only prints and calls the
+  edge actions."
+  [& args]
+  (let [config (parse-args args)]
+    (cond
+      (:help? config)
+      (println usage)
 
-  Admissible iff BOTH :reconsideration/decision-id is present (a specific
-  accepted Decision is named) AND :reconsideration/new-evidence is present and
-  non-blank (empty or whitespace-only evidence does not count). A request lacking
-  either is inadmissible. Note: admissible is NOT authorized — admissibility only
-  permits reconsideration; the prior Decision stays binding until a replacement
-  is accepted through reconciliation (R-14.3), which is decided elsewhere. Pure
-  calculation over a plain map; no I/O."
-  [request]
-  (let [evidence (:reconsideration/new-evidence request)]
-    (and (some? (:reconsideration/decision-id request))
-         (string? evidence)
-         (not (str/blank? evidence)))))
+      (seq (:errors config))
+      (do (binding [*out* *err*]
+            (doseq [e (:errors config)] (println "error:" e))
+            (println)
+            (println usage))
+          config)
 
-;; --- Capability-boundary calculations (design R-1, R-3, R-11; Property 2) ----
-;;
-;; Role capability boundaries are symmetric and enforced fail-closed. This
-;; namespace holds the two PURE pieces of that mechanism: the role -> capability
-;; descriptor mapping, and the violation decision over the produced changes an
-;; invocation actually made. Observing those changes from the filesystem and
-;; classifying each path as a test file or a production/implementation file is an
-;; ACTION living in `workflow.fs`; comparing the classified changes against the
-;; role's allowed set is the CALCULATION here. The fail-closed transition an
-;; observed violation drives is an action in `workflow.orchestrator`.
-;;
-;; A produced change is a plain map {:path p :change :created|:edited :class c},
-;; where :class is the classification the observing action attached — :test for a
-;; test file, :production for a production/implementation file. `capability-for`
-;; maps a role to its descriptor keyword; `capability-descriptors` declares, per
-;; descriptor, the set of change classes the role MAY write.
-
-(def capability-descriptors
-  "Per-capability data: the set of produced-change classes a role MAY write.
-
-  The boundaries are symmetric (design R-1, R-3): the test-designer owns test
-  authorship and is walled out of production; the implementer owns production
-  authorship and is walled out of tests; a reviewer may write nothing at all.
-  Both new-file creation and edits of an out-of-set class are violations — the
-  decision is over the change's :class, not its :change kind."
-  {;; test-designer: may author/edit test files; NO production/implementation
-   ;; files, neither edits nor new-file creation (R-1.4, R-1.5).
-   :test-authoring       #{:test}
-   ;; implementer: may author/edit production files; authors NO tests ever and
-   ;; never modifies existing tests (R-3.1, R-3.2, R-3.5, R-3.6).
-   :production-authoring #{:production}
-   ;; correctness-reviewer / structural-reviewer: read-only; ANY file edit or
-   ;; repair is a violation (R-11.2, R-11.3).
-   :read-only            #{}})
-
-(def role->capability
-  "Pure mapping from workflow role to its capability descriptor keyword.
-
-  test-designer -> :test-authoring, implementer -> :production-authoring, and
-  both reviewers -> :read-only (design Capability descriptors table)."
-  {:test-designer        :test-authoring
-   :implementer          :production-authoring
-   :correctness-reviewer :read-only
-   :structural-reviewer  :read-only})
-
-(defn capability-for
-  "Pure mapping from `role` to its capability descriptor keyword (R-1.4, R-3.1,
-  R-11.2).
-
-  :test-designer -> :test-authoring, :implementer -> :production-authoring, and
-  :correctness-reviewer / :structural-reviewer -> :read-only. Returns nil for an
-  unknown role, so an unrecognized role authorizes nothing (fail closed: it has
-  no allowed change classes downstream). Pure lookup; no I/O."
-  [role]
-  (get role->capability role))
-
-(defn capability-violation?
-  "Return the first produced change that falls outside `capability`'s allowed
-  set, or nil when every change is within boundary (design Property 2).
-
-  `capability` is a descriptor keyword (`:test-authoring`,
-  `:production-authoring`, `:read-only`); `observed-changes` is the collection of
-  produced changes an invocation made, each a map {:path p :change
-  :created|:edited :class :test|:production} classified by the observing action.
-  A change is a violation when its :class is NOT in the descriptor's allowed set
-  — a test-designer touching a production/implementation file, an implementer
-  authoring or modifying any test file, or a reviewer editing any file (R-1.5,
-  R-3.6, R-11.3). Both new-file creation and edits count; the decision is over
-  the change's :class, so the boundaries are symmetric (R-16.6).
-
-  An unknown/absent capability allows nothing, so any change is a violation
-  (fail closed). Returns nil only when there is no offending change. Pure
-  calculation over plain maps; the observation of produced changes and the
-  fail-closed transition a returned violation drives are actions living
-  elsewhere."
-  [capability observed-changes]
-  (let [allowed (get capability-descriptors capability #{})]
-    (first
-     (filter (fn [change]
-               (not (contains? allowed (:class change))))
-             observed-changes))))
-
-;; --- Two-phase Step lifecycle: in-doubt detection (design R-18; Property 15) --
-;;
-;; A Step carries a two-phase intent/outcome lifecycle (R-18.1): the dispatch
-;; intent is committed durably BEFORE the agent runs (:step/status :dispatched)
-;; and the outcome is committed durably AFTER it returns (:step/status :complete
-;; or :failed). A Step found still at :dispatched with no recorded outcome is "in
-;; doubt": on resume it is neither assumed complete nor assumed untouched, and it
-;; must be reconciled against observable reality before an outcome is recorded
-;; (R-18.2, R-18.3). This is a pure decision over the recorded Step map; the
-;; Datalevin read that supplies the Step and the filesystem/verification reads
-;; that reconcile it are actions living elsewhere.
-
-(defn step-in-doubt?
-  "True iff `step` is dispatched with no outcome recorded (R-18.2).
-
-  Holds exactly when :step/status is :dispatched — the intent was committed
-  before the agent ran but no terminal outcome (:complete or :failed) was ever
-  committed after it returned. Such a Step is in doubt on resume: it must be
-  reconciled against observable reality before its outcome is recorded, never
-  assumed complete and never assumed untouched (R-18.2, R-18.3). Any terminal
-  status, or a missing/other status, is not in doubt. Pure calculation over the
-  recorded Step map; no I/O."
-  [step]
-  (= :dispatched (:step/status step)))
-
-;; --- Dispatch eligibility: the Orchestrator's stage prerequisites -----------
-;;
-;; The Orchestrator owns ALL eligibility checks; agents never inspect workflow
-;; state to decide their own eligibility (design, Pure core calculations). Each
-;; stage has a prerequisite over the facts recorded for the CURRENT iteration
-;; (trace-id):
-;;
-;;   :implement          — a relevant test that covers the intended behavior
-;;                         (or demonstrates the defect, for a repair) is recorded
-;;                         (R-2.1, R-2.2, R-2.3, R-16.1, R-16.2).
-;;   :review-structural  — a correctness verdict (APPROVE or REQUEST_CHANGES) is
-;;                         recorded for the current iteration; a correctness
-;;                         REQUEST_CHANGES still enables structural (R-7.1, R-7.2).
-;;
-;; An absent or in-doubt result NEVER satisfies a gate: eligibility is inferred
-;; only from a durably-recorded fact, never from silence, a dispatched-but-
-;; unfinished Step, or a missing artifact (R-7.3, R-18.2). Stages without a
-;; recorded prerequisite here are not gated by this calculation and are governed
-;; by the transition table instead, so this predicate is conservative — an
-;; unknown stage is not declared eligible.
-;;
-;; `trace-facts` is a plain map of the facts recorded for the current iteration,
-;; pulled from Datalevin (or built in tests):
-;;   {:relevant-test?           bool  ; a relevant test is recorded (R-2)
-;;    :correctness-verdict      kw    ; :approve | :request-changes | nil/absent
-;;    :correctness-in-doubt?    bool} ; the correctness Step is dispatched, no outcome
-
-(defn- correctness-verdict-recorded?
-  "True iff a correctness verdict is durably recorded for the current iteration.
-
-  A verdict counts only when it is one of the two terminal review verdicts
-  (:approve or :request-changes) AND the correctness Step is not in doubt — an
-  absent verdict or a dispatched-but-unfinished correctness Step never counts
-  (R-7.1, R-18.2)."
-  [{:keys [correctness-verdict correctness-in-doubt?]}]
-  (and (not correctness-in-doubt?)
-       (contains? #{:approve :request-changes} correctness-verdict)))
-
-(defn dispatch-eligible?
-  "True iff `stage` may be dispatched given the current iteration's `trace-facts`.
-
-  Stage-specific prerequisite check over the facts recorded for the current
-  iteration (trace-id). The Orchestrator owns this check; agents never decide
-  their own eligibility.
-
-  - :implement — eligible only when a relevant test that covers the intended
-    behavior (or demonstrates the defect, for a repair) is recorded
-    (:relevant-test? true); absent such a test, implementation is refused
-    (R-2.1, R-2.2, R-2.3, R-16.1).
-  - :review-structural — eligible only once a correctness verdict (:approve OR
-    :request-changes) is recorded for the current iteration; a correctness
-    REQUEST_CHANGES still enables structural (R-7.1, R-7.2).
-
-  An absent or in-doubt result NEVER satisfies a gate — eligibility is inferred
-  only from a durably-recorded fact, never from silence, a dispatched-but-
-  unfinished Step, timeout, or a missing artifact (R-7.3, R-18.2). Any other
-  stage is not gated by this calculation and returns false (conservative:
-  eligibility is never inferred for a stage this predicate does not name). Pure
-  calculation over a plain facts map; no I/O."
-  [stage trace-facts]
-  (case stage
-    :implement          (boolean (:relevant-test? trace-facts))
-    :review-structural  (correctness-verdict-recorded? trace-facts)
-    false))
-
-;; --- Deriving current state from the append-only event stream (R-17.1) -------
-;;
-;; State-machine progress is stored as an append-only stream of immutable
-;; transition events; current state is DERIVED from the latest event, not mutated
-;; in place (design, Data Models). The current state of a target (a run or a
-;; slice) is the :event/to-state of that target's highest-:event/seq transition
-;; event — :event/seq is monotonic per run and gives a total order. This lets the
-;; materialized :*/state be rebuilt/verified from history so the derived state
-;; can never diverge from the event stream. This is a pure calculation over an
-;; event list; the Datalevin query that supplies the events is an action.
-
-(defn current-state
-  "Derive the current state of `target` from `event-stream` (R-17.1).
-
-  Returns the :event/to-state of the highest-:event/seq transition event that
-  belongs to `target` — the target being the ref value carried on the event's
-  target attribute. Because :event/seq is monotonic per run and totally orders
-  the stream, the highest-seq event's destination state is the current state,
-  reconstructed purely from history (so the materialized :*/state can be rebuilt
-  and verified against it). Events not belonging to `target` are ignored. Returns
-  nil when no event in the stream belongs to `target`.
-
-  `event-stream` is a seq of transition-event maps, each carrying :event/seq,
-  :event/to-state, and a target ref. `target-attr` selects which ref identifies
-  the target (:event/run for a run, :event/slice for a slice); it defaults to
-  :event/slice, the per-slice state these events most often track. Pure
-  calculation over an event list; the query that supplies it is an action."
-  ([event-stream target]
-   (current-state event-stream target :event/slice))
-  ([event-stream target target-attr]
-   (some->> event-stream
-            (filter #(= target (get % target-attr)))
-            seq
-            (apply max-key :event/seq)
-            :event/to-state)))
+      :else
+      (let [result (execute-run! config)]
+        (println "Run" (name (:mode result))
+                 (if (:error result)
+                   (str "failed closed: " (get-in result [:error :message]))
+                   (str "settled"
+                        (when-let [rid (:run-id result)] (str " (run-id " rid ")"))
+                        (when-let [st (get-in result [:drive :state])] (str " at " (name st))))))
+        result))))
